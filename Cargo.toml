@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+pollster = "0.4.0"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "metal"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

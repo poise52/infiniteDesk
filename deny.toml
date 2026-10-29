@@ -1,0 +1,18 @@
+[graph]
+targets = ["aarch64-apple-darwin"]
+all-features = true
+
+[advisories]
+unmaintained = "all"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+allow = ["Apache-2.0", "ISC", "MIT", "Unicode-3.0", "Zlib"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
