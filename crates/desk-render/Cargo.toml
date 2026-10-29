@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
+desk-core = { path = "../desk-core", version = "0.1.0" }
+glyphon.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true

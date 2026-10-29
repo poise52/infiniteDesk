@@ -4,6 +4,11 @@ all-features = true
 
 [advisories]
 unmaintained = "all"
+unsound = "all"
+ignore = [
+  { id = "RUSTSEC-2026-0192", reason = "fontdb parses only the bundled trusted font; replace when cosmic-text migrates" },
+  { id = "RUSTSEC-2026-0253", reason = "glyphon uses Copy glyph keys and pop_lru, not pop with a panicking key destructor" },
+]
 
 [bans]
 multiple-versions = "warn"

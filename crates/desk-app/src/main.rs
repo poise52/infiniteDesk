@@ -4,12 +4,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use desk_core::{Camera, Scene, WindowId, WorldPoint};
 use desk_render::{FrameOutcome, Renderer};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    window::{Window, WindowId},
+    window::{Window, WindowId as NativeWindowId},
 };
 
 #[derive(Debug)]
@@ -53,6 +54,9 @@ impl RetryState {
 struct GpuError(String);
 
 struct App {
+    scene: Scene,
+    camera: Camera,
+    selected: Option<WindowId>,
     proxy: EventLoopProxy<GpuError>,
     retry: RetryState,
     window: Option<Arc<Window>>,
@@ -71,12 +75,13 @@ impl ApplicationHandler<GpuError> for App {
                     .create_window(Window::default_attributes().with_title("InfiniteDesk"))?,
             );
             let proxy = self.proxy.clone();
-            let renderer = pollster::block_on(Renderer::new(
+            let mut renderer = pollster::block_on(Renderer::new(
                 Arc::clone(&window),
                 Arc::new(move |message| {
                     let _ = proxy.send_event(GpuError(message));
                 }),
             ))?;
+            renderer.prewarm(&self.scene, self.camera, self.selected)?;
             Ok((window, renderer))
         })();
         match result {
@@ -92,7 +97,12 @@ impl ApplicationHandler<GpuError> for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        id: NativeWindowId,
+        event: WindowEvent,
+    ) {
         let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
             return;
         };
@@ -107,21 +117,26 @@ impl ApplicationHandler<GpuError> for App {
                 renderer.resize(size);
                 window.request_redraw();
             }
-            WindowEvent::Occluded(false) => window.request_redraw(),
-            WindowEvent::RedrawRequested => match renderer.render() {
-                Ok(FrameOutcome::Retry) => {
-                    let deadline = self.retry.schedule(Instant::now());
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            WindowEvent::Occluded(false) | WindowEvent::ScaleFactorChanged { .. } => {
+                window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                match renderer.render(&self.scene, self.camera, self.selected) {
+                    Ok(FrameOutcome::Retry) => {
+                        let deadline = self.retry.schedule(Instant::now());
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                    }
+                    Ok(FrameOutcome::Presented | FrameOutcome::Occluded) => {
+                        self.retry.reset();
+                        event_loop.set_control_flow(ControlFlow::Wait);
+                    }
+                    Err(error) => {
+                        self.error =
+                            Some(anyhow::Error::new(error).context("failed to render frame"));
+                        event_loop.exit();
+                    }
                 }
-                Ok(FrameOutcome::Presented | FrameOutcome::Occluded) => {
-                    self.retry.reset();
-                    event_loop.set_control_flow(ControlFlow::Wait);
-                }
-                Err(error) => {
-                    self.error = Some(anyhow::Error::new(error).context("failed to render frame"));
-                    event_loop.exit();
-                }
-            },
+            }
             _ => {}
         }
     }
@@ -147,7 +162,28 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<GpuError>::with_user_event()
         .build()
         .context("failed to create event loop")?;
+    let mut scene = Scene::demo(1000, 42)?;
+    for index in 0_u64..12 {
+        let id = WindowId(index);
+        let window = scene.get(id).context("demo window missing")?;
+        let origin = window.bounds().origin();
+        let x = if index == 2 {
+            -190.0
+        } else {
+            f64::from(u32::try_from(index % 4)?).mul_add(245.0, -470.0)
+        };
+        let y = if index == 2 {
+            -285.0
+        } else {
+            f64::from(u32::try_from(index / 4)?).mul_add(190.0, -300.0)
+        };
+        scene.drag(id, x - origin.x(), y - origin.y())?;
+    }
+    let camera = Camera::new(WorldPoint::new(0.0, 0.0)?, 1.0)?;
     let mut app = App {
+        scene,
+        camera,
+        selected: Some(WindowId(11)),
         proxy: event_loop.create_proxy(),
         retry: RetryState::default(),
         window: None,
