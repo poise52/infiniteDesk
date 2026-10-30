@@ -1,4 +1,4 @@
-//! World geometry uses f64 units in ±1e12, zoom 0.01..=100 logical pixels per unit,
+//! World geometry uses f64 units in ±1e12, zoom 1e-7..=100 logical pixels per unit,
 //! and display scales 0.25..=16 physical pixels per logical pixel. These are
 //! application limits, not macOS limits. Rectangles are half-open. Calculations
 //! near the world limit are quantized by f64 spacing (about 0.000122 units at
@@ -8,7 +8,7 @@
 use thiserror::Error;
 
 pub const MAX_WORLD: f64 = 1_000_000_000_000.0;
-pub const MIN_ZOOM: f64 = 0.01;
+pub const MIN_ZOOM: f64 = 0.000_000_1;
 pub const MAX_ZOOM: f64 = 100.0;
 const MAX_LOGICAL: f64 = 1_000_000_000.0;
 
@@ -210,7 +210,7 @@ impl Camera {
     /// The center is in world units; zoom is logical pixels per world unit.
     ///
     /// # Errors
-    /// Rejects non-finite zoom or values outside 0.01..=100.
+    /// Rejects non-finite zoom or values outside 1e-7..=100.
     pub fn new(center: WorldPoint, zoom: f64) -> Result<Self, GeometryError> {
         if !zoom.is_finite() || !(MIN_ZOOM..=MAX_ZOOM).contains(&zoom) {
             return Err(GeometryError::Zoom);
@@ -379,6 +379,36 @@ impl Scene {
             .find(|w| w.id == id)
             .ok_or(GeometryError::UnknownWindow)?;
         window.z = z;
+        Ok(())
+    }
+    /// Raises a window above all others, preserving the relative order of other windows.
+    ///
+    /// # Errors
+    /// Rejects an unknown window or a scene too large to assign z-order values.
+    pub fn raise(&mut self, id: WindowId) -> Result<(), GeometryError> {
+        let index = self
+            .windows
+            .iter()
+            .position(|w| w.id == id)
+            .ok_or(GeometryError::UnknownWindow)?;
+        let max = self
+            .windows
+            .iter()
+            .map(|w| w.z)
+            .max()
+            .ok_or(GeometryError::UnknownWindow)?;
+        if let Some(z) = max.checked_add(1) {
+            self.windows[index].z = z;
+        } else {
+            let mut order: Vec<_> = (0..self.windows.len()).collect();
+            order.sort_unstable_by_key(|&i| (self.windows[i].z, i));
+            let end = i64::try_from(order.len()).map_err(|_| GeometryError::SceneSize)?;
+            for (rank, position) in order.into_iter().enumerate() {
+                self.windows[position].z =
+                    i64::try_from(rank).map_err(|_| GeometryError::SceneSize)?;
+            }
+            self.windows[index].z = end;
+        }
         Ok(())
     }
     /// Returns visible windows intersecting the half-open area, in insertion order.

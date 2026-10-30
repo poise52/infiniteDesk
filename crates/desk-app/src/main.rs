@@ -4,12 +4,17 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use desk_core::{Camera, Scene, WindowId, WorldPoint};
+mod cli;
+mod interaction;
+
+use desk_core::{Camera, PhysicalPoint, WindowId, WorldPoint};
 use desk_render::{FrameOutcome, Renderer};
+use interaction::Board;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowId as NativeWindowId},
 };
 
@@ -54,9 +59,12 @@ impl RetryState {
 struct GpuError(String);
 
 struct App {
-    scene: Scene,
-    camera: Camera,
-    selected: Option<WindowId>,
+    board: Board,
+    startup_focus: bool,
+    space: bool,
+    modifiers: ModifiersState,
+    pointer_button: Option<MouseButton>,
+    occluded: bool,
     proxy: EventLoopProxy<GpuError>,
     retry: RetryState,
     window: Option<Arc<Window>>,
@@ -81,7 +89,13 @@ impl ApplicationHandler<GpuError> for App {
                     let _ = proxy.send_event(GpuError(message));
                 }),
             ))?;
-            renderer.prewarm(&self.scene, self.camera, self.selected)?;
+            let size = window.inner_size();
+            self.board
+                .resize(size.width, size.height, window.scale_factor());
+            if self.startup_focus && !self.board.focus_selected() {
+                anyhow::bail!("unable to focus the requested window in the initial viewport");
+            }
+            renderer.prewarm(&self.board.scene, self.board.camera, self.board.selected)?;
             Ok((window, renderer))
         })();
         match result {
@@ -97,6 +111,7 @@ impl ApplicationHandler<GpuError> for App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -109,24 +124,150 @@ impl ApplicationHandler<GpuError> for App {
         if window.id() != id {
             return;
         }
+        let now = Instant::now();
+        let mut redraw = false;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                self.board
+                    .resize(size.width, size.height, window.scale_factor());
+                self.pointer_button = None;
+                self.occluded = !self.board.has_viewport();
                 self.retry.reset();
                 event_loop.set_control_flow(ControlFlow::Wait);
                 renderer.resize(size);
-                window.request_redraw();
+                redraw = !self.occluded;
             }
-            WindowEvent::Occluded(false) | WindowEvent::ScaleFactorChanged { .. } => {
-                window.request_redraw();
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let size = window.inner_size();
+                self.board
+                    .resize(size.width, size.height, window.scale_factor());
+                self.pointer_button = None;
+                self.occluded = !self.board.has_viewport();
+                redraw = !self.occluded;
             }
-            WindowEvent::RedrawRequested => {
-                match renderer.render(&self.scene, self.camera, self.selected) {
+            WindowEvent::Focused(false) => {
+                self.board.cursor_left();
+                self.space = false;
+                self.pointer_button = None;
+                self.modifiers = ModifiersState::empty();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.board.cursor_left();
+                self.pointer_button = None;
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                redraw = self.board.cursor_moved(
+                    PhysicalPoint {
+                        x: position.x,
+                        y: position.y,
+                    },
+                    now,
+                );
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => {
+                if self.pointer_button.is_none() {
+                    match button {
+                        MouseButton::Middle => {
+                            self.board.start_pan(now);
+                            self.pointer_button = Some(button);
+                        }
+                        MouseButton::Left if self.space => {
+                            self.board.start_pan(now);
+                            self.pointer_button = Some(button);
+                        }
+                        MouseButton::Left => {
+                            redraw = self.board.start_select();
+                            self.pointer_button = Some(button);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } => {
+                redraw = release_pointer(&mut self.board, &mut self.pointer_button, button, now);
+            }
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                if phase == TouchPhase::Cancelled {
+                    self.board.cancel();
+                    self.pointer_button = None;
+                } else {
+                    let (dx, dy) = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => {
+                            (f64::from(x) * 40.0, f64::from(y) * 40.0)
+                        }
+                        MouseScrollDelta::PixelDelta(p) => {
+                            (p.x / window.scale_factor(), p.y / window.scale_factor())
+                        }
+                    };
+                    self.pointer_button = None;
+                    redraw = if self.modifiers.control_key() || self.modifiers.super_key() {
+                        self.board.zoom((dy * 0.002).exp())
+                    } else {
+                        self.board.wheel_pan(dx, dy)
+                    };
+                }
+            }
+            WindowEvent::PinchGesture { delta, phase, .. } => {
+                self.pointer_button = None;
+                if phase == TouchPhase::Cancelled {
+                    self.board.cancel();
+                } else {
+                    redraw = self.board.zoom(1.0 + delta);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    if key == KeyCode::Space {
+                        self.space = event.state == ElementState::Pressed;
+                    } else if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && let Some(changed) = route_key(
+                            &mut self.board,
+                            &mut self.pointer_button,
+                            key,
+                            self.modifiers,
+                        )
+                    {
+                        redraw = changed;
+                    }
+                }
+            }
+            WindowEvent::Occluded(true) => {
+                self.occluded = true;
+                self.board.cancel();
+                self.pointer_button = None;
+            }
+            WindowEvent::Occluded(false) => {
+                self.occluded = !self.board.has_viewport();
+                self.retry.reset();
+                event_loop.set_control_flow(ControlFlow::Wait);
+                redraw = true;
+            }
+            WindowEvent::RedrawRequested if !self.occluded && self.retry.deadline.is_none() => {
+                self.board.tick(now);
+                match renderer.render(&self.board.scene, self.board.camera, self.board.selected) {
                     Ok(FrameOutcome::Retry) => {
                         let deadline = self.retry.schedule(Instant::now());
                         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                     }
-                    Ok(FrameOutcome::Presented | FrameOutcome::Occluded) => {
+                    Ok(FrameOutcome::Presented) => {
+                        self.retry.reset();
+                        event_loop.set_control_flow(ControlFlow::Wait);
+                        redraw = self.board.inertia_active();
+                    }
+                    Ok(FrameOutcome::Occluded) => {
+                        self.board.cancel();
+                        self.occluded = true;
                         self.retry.reset();
                         event_loop.set_control_flow(ControlFlow::Wait);
                     }
@@ -139,7 +280,11 @@ impl ApplicationHandler<GpuError> for App {
             }
             _ => {}
         }
+        if redraw && !self.occluded && self.retry.deadline.is_none() {
+            window.request_redraw();
+        }
     }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, error: GpuError) {
         self.error = Some(anyhow::anyhow!(error.0));
         event_loop.exit();
@@ -155,35 +300,65 @@ impl ApplicationHandler<GpuError> for App {
     }
 }
 
+fn route_key(
+    board: &mut Board,
+    pointer: &mut Option<MouseButton>,
+    key: KeyCode,
+    modifiers: ModifiersState,
+) -> Option<bool> {
+    let changed = match key {
+        KeyCode::KeyR => board.reset(),
+        KeyCode::KeyF => board.fit_all(),
+        KeyCode::Enter => board.focus_selected(),
+        KeyCode::Tab => board.cycle(modifiers.shift_key()),
+        KeyCode::Escape => {
+            board.cancel();
+            false
+        }
+        _ => return None,
+    };
+    *pointer = None;
+    Some(changed)
+}
+
+fn release_pointer(
+    board: &mut Board,
+    pointer: &mut Option<MouseButton>,
+    button: MouseButton,
+    now: Instant,
+) -> bool {
+    if *pointer == Some(button) {
+        *pointer = None;
+        board.release(now)
+    } else {
+        false
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    let options = match cli::parse(std::env::args_os().skip(1)).map_err(anyhow::Error::msg)? {
+        cli::Command::Help => {
+            print!("{}", cli::HELP);
+            return Ok(());
+        }
+        cli::Command::Run(options) => options,
+    };
+    let scene = interaction::clustered_demo(options.windows, options.seed)?;
+    let camera = Camera::new(WorldPoint::new(0.0, 0.0)?, 1.0)?;
+    let board = Board::new(scene, camera, Some(WindowId(options.focus.unwrap_or(11))));
     let event_loop = EventLoop::<GpuError>::with_user_event()
         .build()
         .context("failed to create event loop")?;
-    let mut scene = Scene::demo(1000, 42)?;
-    for index in 0_u64..12 {
-        let id = WindowId(index);
-        let window = scene.get(id).context("demo window missing")?;
-        let origin = window.bounds().origin();
-        let x = if index == 2 {
-            -190.0
-        } else {
-            f64::from(u32::try_from(index % 4)?).mul_add(245.0, -470.0)
-        };
-        let y = if index == 2 {
-            -285.0
-        } else {
-            f64::from(u32::try_from(index / 4)?).mul_add(190.0, -300.0)
-        };
-        scene.drag(id, x - origin.x(), y - origin.y())?;
-    }
-    let camera = Camera::new(WorldPoint::new(0.0, 0.0)?, 1.0)?;
     let mut app = App {
-        scene,
-        camera,
-        selected: Some(WindowId(11)),
+        board,
+        startup_focus: options.focus.is_some(),
+        space: false,
+        modifiers: ModifiersState::empty(),
+        pointer_button: None,
+        occluded: false,
         proxy: event_loop.create_proxy(),
         retry: RetryState::default(),
         window: None,
@@ -200,6 +375,48 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_key_preserves_pointer_release_and_ends_drag() -> Result<(), desk_core::GeometryError>
+    {
+        let mut scene = desk_core::Scene::default();
+        let bounds = desk_core::WorldRect::new(WorldPoint::new(-50.0, -50.0)?, 100.0, 100.0)?;
+        scene.add(desk_core::Window::new(
+            WindowId(1),
+            "test".into(),
+            bounds,
+            [0, 0, 0, 255],
+            0,
+        ))?;
+        let mut board = Board::new(scene, Camera::new(WorldPoint::new(0.0, 0.0)?, 1.0)?, None);
+        board.resize(800, 600, 1.0);
+        let now = Instant::now();
+        board.cursor_moved(PhysicalPoint { x: 400.0, y: 300.0 }, now);
+        assert!(board.start_select());
+        let mut pointer = Some(MouseButton::Left);
+        assert_eq!(
+            route_key(
+                &mut board,
+                &mut pointer,
+                KeyCode::KeyA,
+                ModifiersState::empty()
+            ),
+            None
+        );
+        assert_eq!(pointer, Some(MouseButton::Left));
+        release_pointer(&mut board, &mut pointer, MouseButton::Left, now);
+        assert!(!board.cursor_moved(PhysicalPoint { x: 420.0, y: 320.0 }, now));
+        assert_eq!(
+            board
+                .scene
+                .get(WindowId(1))
+                .ok_or(desk_core::GeometryError::UnknownWindow)?
+                .bounds()
+                .origin(),
+            WorldPoint::new(-50.0, -50.0)?
+        );
+        Ok(())
+    }
 
     #[test]
     fn retry_backoff_is_bounded_and_reset_cancels_pending_retry() {

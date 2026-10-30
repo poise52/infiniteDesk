@@ -218,3 +218,28 @@ fn demo_is_seeded_unique_and_survives_repeated_operations() -> Result<(), Geomet
     assert!(Scene::demo(10_001, 0).is_err());
     Ok(())
 }
+
+#[test]
+fn raise_normalizes_overflow_without_changing_other_ties() -> Result<(), GeometryError> {
+    let bounds = rect(0.0, 0.0, 5.0, 5.0)?;
+    let mut scene = Scene::default();
+    for id in 0..3 {
+        scene.add(window(id, bounds, i64::MAX))?;
+    }
+    scene.raise(WindowId(0))?;
+    assert_eq!(
+        scene.hit_test(point(1.0, 1.0)?).map(Window::id),
+        Some(WindowId(0))
+    );
+    assert!(
+        scene
+            .get(WindowId(2))
+            .ok_or(GeometryError::UnknownWindow)?
+            .z
+            > scene
+                .get(WindowId(1))
+                .ok_or(GeometryError::UnknownWindow)?
+                .z
+    );
+    Ok(())
+}

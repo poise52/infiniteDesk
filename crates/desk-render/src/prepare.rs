@@ -93,7 +93,13 @@ pub fn prepare(
         let y = b.origin().y();
         let r = x + b.width();
         let bottom = y + b.height();
-        let border = 1.0_f64.min(b.width() / 2.0).min(b.height() / 2.0);
+        let border = if selection == Some(window.id()) {
+            3.0_f64
+        } else {
+            1.0_f64
+        }
+        .min(b.width() / 2.0)
+        .min(b.height() / 2.0);
         let header = (y + 30.0).min(bottom - border);
         let depth = 1.0 - (rank + 1) as f32 / (count + 1) as f32;
         let edge = if selection == Some(window.id()) {
