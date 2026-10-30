@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+mod benchmark;
 mod cli;
 mod interaction;
 
@@ -15,7 +16,7 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
-    window::{Window, WindowId as NativeWindowId},
+    window::{Window, WindowAttributes, WindowId as NativeWindowId, WindowLevel},
 };
 
 #[derive(Debug)]
@@ -61,6 +62,8 @@ struct GpuError(String);
 struct App {
     board: Board,
     startup_focus: bool,
+    benchmark_options: Option<cli::Options>,
+    benchmark: Option<benchmark::Benchmark>,
     space: bool,
     modifiers: ModifiersState,
     pointer_button: Option<MouseButton>,
@@ -79,8 +82,7 @@ impl ApplicationHandler<GpuError> for App {
         }
         let result = (|| -> Result<_> {
             let window = Arc::new(
-                event_loop
-                    .create_window(Window::default_attributes().with_title("InfiniteDesk"))?,
+                event_loop.create_window(window_attributes(self.benchmark_options.is_some()))?,
             );
             let proxy = self.proxy.clone();
             let mut renderer = pollster::block_on(Renderer::new(
@@ -95,7 +97,25 @@ impl ApplicationHandler<GpuError> for App {
             if self.startup_focus && !self.board.focus_selected() {
                 anyhow::bail!("unable to focus the requested window in the initial viewport");
             }
+            if let Some(options) = self.benchmark_options.take() {
+                renderer.enable_metrics();
+                self.benchmark = Some(benchmark::Benchmark::new(
+                    options,
+                    &mut self.board,
+                    size.width,
+                    size.height,
+                    window.scale_factor(),
+                    renderer.adapter_info().to_owned(),
+                    format!("{:?}", renderer.present_mode()),
+                    renderer.validation_flags().to_owned(),
+                    renderer.device_limits().to_owned(),
+                    renderer.timestamp_supported(),
+                )?);
+            }
             renderer.prewarm(&self.board.scene, self.board.camera, self.board.selected)?;
+            if let Some(benchmark) = &mut self.benchmark {
+                benchmark.begin_after_init();
+            }
             Ok((window, renderer))
         })();
         match result {
@@ -126,9 +146,43 @@ impl ApplicationHandler<GpuError> for App {
         }
         let now = Instant::now();
         let mut redraw = false;
+        if self.benchmark.is_some()
+            && matches!(
+                event,
+                WindowEvent::CursorMoved { .. }
+                    | WindowEvent::CursorLeft { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::PinchGesture { .. }
+                    | WindowEvent::KeyboardInput { .. }
+            )
+        {
+            return;
+        }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(benchmark) = &mut self.benchmark {
+                    benchmark.incomplete = Some("window closed before completion".into());
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
+                if let Some(benchmark) = &mut self.benchmark
+                    && (size.width == 0 || size.height == 0)
+                {
+                    benchmark.incomplete = Some("window minimized or zero viewport".into());
+                    event_loop.exit();
+                    return;
+                }
+                if let Some(benchmark) = &mut self.benchmark
+                    && size.width > 0
+                    && size.height > 0
+                    && !benchmark.viewport_matches(size.width, size.height, window.scale_factor())
+                {
+                    benchmark.incomplete = Some("viewport changed during benchmark".into());
+                    event_loop.exit();
+                    return;
+                }
                 self.board
                     .resize(size.width, size.height, window.scale_factor());
                 self.pointer_button = None;
@@ -140,6 +194,15 @@ impl ApplicationHandler<GpuError> for App {
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 let size = window.inner_size();
+                if let Some(benchmark) = &mut self.benchmark
+                    && size.width > 0
+                    && size.height > 0
+                    && !benchmark.viewport_matches(size.width, size.height, window.scale_factor())
+                {
+                    benchmark.incomplete = Some("viewport scale changed during benchmark".into());
+                    event_loop.exit();
+                    return;
+                }
                 self.board
                     .resize(size.width, size.height, window.scale_factor());
                 self.pointer_button = None;
@@ -243,6 +306,13 @@ impl ApplicationHandler<GpuError> for App {
                 }
             }
             WindowEvent::Occluded(true) => {
+                if let Some(benchmark) = &mut self.benchmark {
+                    if benchmark.started {
+                        benchmark.incomplete = Some("window occluded during benchmark".into());
+                        event_loop.exit();
+                    }
+                    return;
+                }
                 self.occluded = true;
                 self.board.cancel();
                 self.pointer_button = None;
@@ -254,18 +324,57 @@ impl ApplicationHandler<GpuError> for App {
                 redraw = true;
             }
             WindowEvent::RedrawRequested if !self.occluded && self.retry.deadline.is_none() => {
-                self.board.tick(now);
+                let update_ms = if let Some(benchmark) = &mut self.benchmark {
+                    match benchmark.update(&mut self.board, now) {
+                        Ok(ms) => ms,
+                        Err(error) => {
+                            benchmark.incomplete = Some(format!("scenario update failed: {error}"));
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                } else {
+                    self.board.tick(now);
+                    0.0
+                };
                 match renderer.render(&self.board.scene, self.board.camera, self.board.selected) {
                     Ok(FrameOutcome::Retry) => {
+                        if let Some(benchmark) = &mut self.benchmark {
+                            benchmark.retry();
+                        }
                         let deadline = self.retry.schedule(Instant::now());
                         event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
                     }
                     Ok(FrameOutcome::Presented) => {
                         self.retry.reset();
                         event_loop.set_control_flow(ControlFlow::Wait);
-                        redraw = self.board.inertia_active();
+                        if let Some(benchmark) = &mut self.benchmark {
+                            let completed_at = Instant::now();
+                            benchmark.first_frame_completed(completed_at);
+                            benchmark.record(completed_at, update_ms, renderer.metrics());
+                            if benchmark.completed || benchmark.incomplete.is_some() {
+                                event_loop.exit();
+                            } else {
+                                redraw = true;
+                            }
+                        } else {
+                            redraw = self.board.inertia_active();
+                        }
                     }
                     Ok(FrameOutcome::Occluded) => {
+                        if let Some(benchmark) = &mut self.benchmark {
+                            if benchmark.started {
+                                benchmark.incomplete =
+                                    Some("surface occluded during benchmark".into());
+                                event_loop.exit();
+                            } else {
+                                benchmark.startup_occluded();
+                                benchmark.retry();
+                                let deadline = self.retry.schedule(Instant::now());
+                                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                            }
+                            return;
+                        }
                         self.board.cancel();
                         self.occluded = true;
                         self.retry.reset();
@@ -291,12 +400,42 @@ impl ApplicationHandler<GpuError> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.retry.take_due(Instant::now()) {
-            event_loop.set_control_flow(ControlFlow::Wait);
-            if let Some(window) = &self.window {
-                window.request_redraw();
-            }
+        let now = Instant::now();
+        if let Some(benchmark) = &mut self.benchmark
+            && now >= benchmark.deadline
+        {
+            benchmark.incomplete = Some(
+                "deadline reached before completion (window occluded or frame acquisition stalled)"
+                    .into(),
+            );
+            event_loop.exit();
+            return;
         }
+        if self.retry.take_due(now)
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+        let deadline = match (
+            self.retry.deadline,
+            self.benchmark.as_ref().map(|b| b.deadline),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+}
+
+fn window_attributes(benchmark: bool) -> WindowAttributes {
+    let attributes = Window::default_attributes().with_title("InfiniteDesk");
+    if benchmark {
+        attributes
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_active(true)
+    } else {
+        attributes
     }
 }
 
@@ -349,12 +488,17 @@ fn main() -> Result<()> {
     let scene = interaction::clustered_demo(options.windows, options.seed)?;
     let camera = Camera::new(WorldPoint::new(0.0, 0.0)?, 1.0)?;
     let board = Board::new(scene, camera, Some(WindowId(options.focus.unwrap_or(11))));
+    if options.mode == cli::Mode::Microbench {
+        return benchmark::microbench(&options, board);
+    }
     let event_loop = EventLoop::<GpuError>::with_user_event()
         .build()
         .context("failed to create event loop")?;
     let mut app = App {
         board,
         startup_focus: options.focus.is_some(),
+        benchmark_options: (options.mode == cli::Mode::Benchmark).then_some(options),
+        benchmark: None,
         space: false,
         modifiers: ModifiersState::empty(),
         pointer_button: None,
@@ -365,7 +509,21 @@ fn main() -> Result<()> {
         renderer: None,
         error: None,
     };
-    event_loop.run_app(&mut app).context("event loop failed")?;
+    if let Err(error) = event_loop.run_app(&mut app) {
+        app.error = Some(anyhow::Error::new(error).context("event loop failed"));
+    }
+    if let Some(benchmark) = &mut app.benchmark {
+        if app.error.is_some() && benchmark.incomplete.is_none() {
+            benchmark.incomplete = Some("render failed".into());
+        }
+        benchmark.finish()?;
+        if !benchmark.completed {
+            anyhow::bail!(
+                "benchmark incomplete: {}",
+                benchmark.incomplete.as_deref().unwrap_or("unknown reason")
+            );
+        }
+    }
     if let Some(error) = app.error {
         return Err(error);
     }
@@ -375,6 +533,15 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benchmark_window_requests_floating_active_without_changing_demo_level() {
+        let demo = window_attributes(false);
+        let bench = window_attributes(true);
+        assert_eq!(demo.window_level, WindowLevel::Normal);
+        assert_eq!(bench.window_level, WindowLevel::AlwaysOnTop);
+        assert!(bench.active);
+    }
 
     #[test]
     fn unknown_key_preserves_pointer_release_and_ends_drag() -> Result<(), desk_core::GeometryError>

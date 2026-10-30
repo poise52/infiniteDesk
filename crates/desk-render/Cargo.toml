@@ -9,6 +9,7 @@ license.workspace = true
 bytemuck.workspace = true
 desk-core = { path = "../desk-core", version = "0.1.0" }
 glyphon.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wgpu.workspace = true

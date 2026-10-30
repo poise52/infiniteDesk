@@ -6,7 +6,7 @@ use glyphon::{
     TextArea, TextAtlas, TextBounds, TextRenderer,
 };
 use prepare::{Instance, Label};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
@@ -40,6 +40,35 @@ pub enum FrameOutcome {
     Occluded,
 }
 
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct FrameMetrics {
+    pub acquire_ms: f64,
+    pub geometry_ms: f64,
+    pub upload_ms: f64,
+    pub text_ms: f64,
+    pub encode_ms: f64,
+    pub submit_ms: f64,
+    pub present_call_ms: f64,
+    pub visible: usize,
+    pub primitives: usize,
+    pub labels: usize,
+    pub layout_hits: usize,
+    pub layout_misses: usize,
+    pub retained_layouts: usize,
+    pub raster_cache_entries: usize,
+    pub upload_bytes: usize,
+    pub instance_capacity: usize,
+    pub instance_capacity_bytes: usize,
+    pub known_buffer_count: usize,
+    pub known_uniform_bytes: usize,
+    pub depth_texture_logical_bytes: u64,
+    pub draw_calls_min: usize,
+    pub draw_calls_max: usize,
+}
+fn ms(start: Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
+}
+
 struct TextLayout {
     title: String,
     buffer: Buffer,
@@ -69,6 +98,12 @@ pub struct Renderer {
     visible: Vec<usize>,
     labels: Vec<Label>,
     depths: HashMap<usize, f32>,
+    measure: bool,
+    metrics: FrameMetrics,
+    adapter_info: String,
+    validation_flags: String,
+    device_limits: String,
+    timestamp_supported: bool,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -102,6 +137,7 @@ impl Renderer {
         let size = window.inner_size();
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::METAL;
+        let validation_flags = format!("{:?}", descriptor.flags);
         let instance = wgpu::Instance::new(descriptor);
         let surface = instance.create_surface(Arc::clone(&window))?;
         let adapter = instance
@@ -110,10 +146,13 @@ impl Renderer {
                 ..Default::default()
             })
             .await?;
-        tracing::info!(adapter = ?adapter.get_info(), "selected GPU adapter");
+        let adapter_info = format!("{:?}", adapter.get_info());
+        let timestamp_supported = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        tracing::info!(adapter = %adapter_info, "selected GPU adapter");
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await?;
+        let device_limits = format!("{:?}", device.limits());
         let on_uncaptured = Arc::clone(&on_gpu_error);
         device.on_uncaptured_error(Arc::new(move |error| {
             on_uncaptured(format!("GPU error: {error}"));
@@ -227,6 +266,12 @@ impl Renderer {
             visible: Vec::new(),
             labels: Vec::new(),
             depths: HashMap::new(),
+            measure: false,
+            metrics: FrameMetrics::default(),
+            adapter_info,
+            validation_flags,
+            device_limits,
+            timestamp_supported,
         };
         renderer.configure();
         Ok(renderer)
@@ -272,6 +317,38 @@ impl Renderer {
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         self.size = size;
         self.configure();
+    }
+
+    pub const fn enable_metrics(&mut self) {
+        self.measure = true;
+    }
+    #[must_use]
+    pub const fn metrics(&self) -> FrameMetrics {
+        self.metrics
+    }
+    #[must_use]
+    pub fn validation_flags(&self) -> &str {
+        &self.validation_flags
+    }
+    #[must_use]
+    pub fn device_limits(&self) -> &str {
+        &self.device_limits
+    }
+    #[must_use]
+    pub const fn timestamp_supported(&self) -> bool {
+        self.timestamp_supported
+    }
+    #[must_use]
+    pub fn adapter_info(&self) -> &str {
+        &self.adapter_info
+    }
+    #[must_use]
+    pub const fn present_mode(&self) -> wgpu::PresentMode {
+        self.config.present_mode
+    }
+    #[must_use]
+    pub const fn physical_size(&self) -> PhysicalSize<u32> {
+        self.size
     }
 
     /// Prepares the first visible text layouts and glyphs before the initial redraw.
@@ -328,6 +405,7 @@ impl Renderer {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(FrameOutcome::Occluded);
         }
+        let mark = self.measure.then(Instant::now);
         let (frame, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
@@ -346,6 +424,10 @@ impl Renderer {
                 return Err(RenderError::Frame("validation error"));
             }
         };
+        if let Some(mark) = mark {
+            self.metrics.acquire_ms = ms(mark);
+        }
+        let mark = self.measure.then(Instant::now);
         let viewport = Viewport::new(
             self.size.width,
             self.size.height,
@@ -360,6 +442,10 @@ impl Renderer {
             &mut self.scratch,
             &mut self.labels,
         )?;
+        if let Some(mark) = mark {
+            self.metrics.geometry_ms = ms(mark);
+        }
+        let mark = self.measure.then(Instant::now);
         if self.scratch.len() > self.capacity {
             self.capacity = self
                 .scratch
@@ -382,7 +468,15 @@ impl Renderer {
                 height: self.size.height,
             },
         );
+        if let Some(mark) = mark {
+            self.metrics.upload_ms = ms(mark);
+        }
+        let mark = self.measure.then(Instant::now);
         self.prepare_text(scene, (camera.zoom() * viewport.scale()) as f32)?;
+        if let Some(mark) = mark {
+            self.metrics.text_ms = ms(mark);
+        }
+        let mark = self.measure.then(Instant::now);
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -432,8 +526,34 @@ impl Renderer {
             self.text
                 .render(&self.atlas, &self.text_viewport, &mut pass)?;
         }
-        self.queue.submit([encoder.finish()]);
+        let command = encoder.finish();
+        if let Some(mark) = mark {
+            self.metrics.encode_ms = ms(mark);
+        }
+        let mark = self.measure.then(Instant::now);
+        self.queue.submit([command]);
+        if let Some(mark) = mark {
+            self.metrics.submit_ms = ms(mark);
+        }
+        let mark = self.measure.then(Instant::now);
         self.queue.present(frame);
+        if let Some(mark) = mark {
+            self.metrics.present_call_ms = ms(mark);
+            self.metrics.visible = self.visible.len();
+            self.metrics.primitives = self.scratch.len();
+            self.metrics.labels = self.labels.len();
+            self.metrics.retained_layouts = self.layouts.len();
+            self.metrics.raster_cache_entries = self.swash.image_cache.len();
+            self.metrics.upload_bytes = self.scratch.len() * std::mem::size_of::<Instance>() + 16;
+            self.metrics.instance_capacity = self.capacity;
+            self.metrics.instance_capacity_bytes = self.capacity * std::mem::size_of::<Instance>();
+            self.metrics.known_buffer_count = 2;
+            self.metrics.known_uniform_bytes = 16;
+            self.metrics.depth_texture_logical_bytes =
+                u64::from(self.size.width) * u64::from(self.size.height) * 4;
+            self.metrics.draw_calls_min = 1;
+            self.metrics.draw_calls_max = if self.labels.is_empty() { 1 } else { 2 };
+        }
         drop(view);
         self.atlas.trim();
         if suboptimal {
@@ -448,6 +568,10 @@ impl Renderer {
 
     fn prepare_text(&mut self, scene: &Scene, scale: f32) -> Result<(), RenderError> {
         self.depths.clear();
+        if self.measure {
+            self.metrics.layout_hits = 0;
+            self.metrics.layout_misses = 0;
+        }
         if self.swash.image_cache.len() > 4096 {
             self.swash.image_cache.clear();
         }
@@ -456,11 +580,25 @@ impl Renderer {
             let id = window.id();
             let metadata = usize::try_from(id.0).map_err(|_| RenderError::Capacity)?;
             self.depths.insert(metadata, label.depth);
-            let entry = self.layouts.entry(id).or_insert_with(|| TextLayout {
-                title: String::new(),
-                buffer: Buffer::new(&mut self.fonts, Metrics::new(14.0, 20.0)),
-            });
-            if entry.title != window.title {
+            let (entry, is_new) = match self.layouts.entry(id) {
+                std::collections::hash_map::Entry::Occupied(entry) => (entry.into_mut(), false),
+                std::collections::hash_map::Entry::Vacant(entry) => (
+                    entry.insert(TextLayout {
+                        title: String::new(),
+                        buffer: Buffer::new(&mut self.fonts, Metrics::new(14.0, 20.0)),
+                    }),
+                    true,
+                ),
+            };
+            let changed = is_new || entry.title != window.title;
+            if self.measure {
+                if changed {
+                    self.metrics.layout_misses += 1;
+                } else {
+                    self.metrics.layout_hits += 1;
+                }
+            }
+            if changed {
                 entry.title.clone_from(&window.title);
                 entry.buffer.set_text(
                     &entry.title,
@@ -505,4 +643,58 @@ impl Renderer {
         )?;
         Ok(())
     }
+}
+
+/// Measures CPU-only visible filtering and geometry preparation; no GPU work is performed.
+///
+/// # Errors
+/// Rejects unsupported viewport geometry.
+pub fn benchmark_prepare(
+    scene: &Scene,
+    camera: Camera,
+    viewport: Viewport,
+    iterations: usize,
+) -> Result<(f64, f64, f64, usize), RenderError> {
+    use std::hint::black_box;
+    let area = camera.bounds(viewport)?;
+    let start = Instant::now();
+    for _ in 0..iterations {
+        black_box(black_box(scene).visible(black_box(area)).count());
+    }
+    let culling = ms(start);
+    let mut visible = Vec::new();
+    let mut instances = Vec::new();
+    let mut labels = Vec::new();
+    prepare::prepare(
+        scene,
+        camera,
+        viewport,
+        None,
+        &mut visible,
+        &mut instances,
+        &mut labels,
+    )?;
+    let mut sort_time = std::time::Duration::ZERO;
+    for _ in 0..iterations {
+        let start = Instant::now();
+        visible.sort_unstable_by_key(|index| (black_box(scene).windows()[*index].z, *index));
+        sort_time += start.elapsed();
+        black_box(&visible);
+        visible.reverse();
+    }
+    let sort = sort_time.as_secs_f64() * 1000.0;
+    let start = Instant::now();
+    for _ in 0..iterations {
+        prepare::prepare(
+            black_box(scene),
+            black_box(camera),
+            black_box(viewport),
+            None,
+            &mut visible,
+            &mut instances,
+            &mut labels,
+        )?;
+        black_box(&instances);
+    }
+    Ok((culling, sort, ms(start), visible.len()))
 }
