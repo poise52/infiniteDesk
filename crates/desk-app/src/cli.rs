@@ -24,13 +24,14 @@ pub struct Options {
     pub output: Option<PathBuf>,
     pub scenario: Scenario,
     pub target_hz: u32,
+    pub gpu_timestamps: bool,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Run(Options),
     Help,
 }
-pub const HELP: &str = "InfiniteDesk\n\nUsage: desk-app [--demo|--benchmark|--microbench] [--windows 100|1000|5000|10000] [--seed N] [--focus ID] [--duration SECONDS] [--warmup SECONDS] [--scenario sparse|dense|fit-all] [--target-hz HZ] [--output PATH]\n\nBenchmark duration: 1..=600 s; warmup: 0..=60 s; target-hz: 10..=1000 (reference, not measured refresh).\n";
+pub const HELP: &str = "InfiniteDesk\n\nUsage: desk-app [--demo|--benchmark|--microbench] [--windows 100|1000|5000|10000] [--seed N] [--focus ID] [--duration SECONDS] [--warmup SECONDS] [--scenario sparse|dense|fit-all] [--target-hz HZ] [--gpu-timestamps] [--output PATH]\n\nBenchmark duration: 1..=600 s; warmup: 0..=60 s; target-hz: 10..=1000 (reference, not measured refresh).\n--gpu-timestamps opts in to asynchronous GPU render-pass timing when supported.\n";
 
 #[allow(clippy::too_many_lines)]
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
@@ -44,6 +45,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
         output: None,
         scenario: Scenario::Sparse,
         target_hz: 60,
+        gpu_timestamps: false,
     };
     let mut mode = None;
     let mut benchmark_option = false;
@@ -69,6 +71,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
                 options.mode = next;
             }
             "-h" | "--help" => return Ok(Command::Help),
+            "--gpu-timestamps" => {
+                options.gpu_timestamps = true;
+                benchmark_option = true;
+                timing_option = true;
+            }
             "--windows" | "--seed" | "--focus" | "--duration" | "--warmup" | "--target-hz"
             | "--scenario" | "--output" => {
                 let value = args
@@ -178,6 +185,8 @@ mod tests {
             &["--benchmark", "--target-hz", "0"],
             &["--scenario", "dense"],
             &["--microbench", "--duration", "10"],
+            &["--microbench", "--gpu-timestamps"],
+            &["--demo", "--gpu-timestamps"],
         ] {
             assert!(parse(args(values)).is_err(), "{values:?}");
         }
@@ -196,5 +205,9 @@ mod tests {
             panic!("valid args rejected")
         };
         assert_eq!(options.scenario, Scenario::Dense);
+        let Ok(Command::Run(options)) = parse(args(&["--benchmark", "--gpu-timestamps"])) else {
+            panic!("valid args rejected")
+        };
+        assert!(options.gpu_timestamps);
     }
 }

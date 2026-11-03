@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use desk_core::{Camera, WindowId, WorldPoint};
-use desk_render::FrameMetrics;
+use desk_render::{FrameMetrics, GpuReport};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -172,6 +172,43 @@ fn stats(intervals: &[f64], target_hz: u32) -> Option<Statistics> {
     })
 }
 
+fn gpu_measurement_values(samples: &[Sample], gpu: &[desk_render::GpuSample]) -> Vec<f64> {
+    let sample_ids: std::collections::HashSet<_> =
+        samples.iter().map(|sample| sample.frame.frame_id).collect();
+    let mut values: Vec<_> = gpu
+        .iter()
+        .filter(|sample| sample_ids.contains(&sample.frame_id))
+        .map(|sample| sample.render_pass_ms)
+        .collect();
+    values.sort_unstable_by(f64::total_cmp);
+    values
+}
+
+const fn gpu_statistics_unavailable_reason(
+    gpu: &GpuReport,
+    expected: usize,
+    matched: usize,
+    completed: bool,
+) -> Option<&'static str> {
+    if !completed {
+        Some("benchmark incomplete")
+    } else if !gpu.enabled {
+        Some("timestamp measurement unavailable or disabled")
+    } else if gpu.invalid_timestamps_total > 0 {
+        Some("invalid timestamp pairs observed; all pairs are untrusted")
+    } else if gpu.map_errors_total > 0 || gpu.poll_errors_total > 0 {
+        Some("timestamp readback or polling failed")
+    } else if gpu.pending_at_drain_end > 0 {
+        Some("timestamp readbacks remained pending after bounded drain")
+    } else if expected == 0 {
+        Some("no measured CPU frames")
+    } else if matched != expected {
+        Some("incomplete measurement frame coverage")
+    } else {
+        None
+    }
+}
+
 fn stage_percentiles(samples: &[Sample]) -> serde_json::Value {
     if samples.is_empty() {
         return serde_json::json!("unavailable");
@@ -214,6 +251,19 @@ fn stage_percentiles(samples: &[Sample]) -> serde_json::Value {
         let rank = |p: usize| sorted[(n * p).div_ceil(100) - 1];
         stages.insert(
             name.to_owned(),
+            serde_json::json!({"p50":rank(50),"p95":rank(95),"p99":rank(99)}),
+        );
+    }
+    let mut poll: Vec<_> = samples
+        .iter()
+        .filter_map(|sample| sample.frame.gpu_poll_ms)
+        .collect();
+    if !poll.is_empty() {
+        poll.sort_unstable_by(f64::total_cmp);
+        let n = poll.len();
+        let rank = |p: usize| poll[(n * p).div_ceil(100) - 1];
+        stages.insert(
+            "gpu_poll".to_owned(),
             serde_json::json!({"p50":rank(50),"p95":rank(95),"p99":rank(99)}),
         );
     }
@@ -384,17 +434,33 @@ impl Benchmark {
     pub const fn retry(&mut self) {
         self.retries += 1;
     }
-    pub fn finish(&self) -> Result<()> {
+    #[allow(clippy::cast_precision_loss)]
+    pub fn finish(&self, gpu: &GpuReport) -> Result<()> {
         let intervals: Vec<_> = self.samples.iter().map(|s| s.interval_ms).collect();
         let stages = stage_percentiles(&self.samples);
+        let gpu_values = gpu_measurement_values(&self.samples, &gpu.raw_gpu_samples);
+        let gpu_reason = gpu_statistics_unavailable_reason(
+            gpu,
+            self.samples.len(),
+            gpu_values.len(),
+            self.completed,
+        );
+        let gpu_stats = if gpu_reason.is_some() {
+            serde_json::json!("unavailable")
+        } else {
+            let n = gpu_values.len();
+            let rank = |percent: usize| gpu_values[(n * percent).div_ceil(100) - 1];
+            serde_json::json!({"count": n, "p50_ms": rank(50), "p95_ms": rank(95), "p99_ms": rank(99)})
+        };
         let result = serde_json::json!({
             "schema_version":1, "status": if self.completed { "complete" } else { "incomplete" }, "reason":self.incomplete,
             "timestamp_unix_seconds":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             "identity":self.identity, "system":self.system, "parameters":{"windows":self.options.windows,"seed":self.options.seed,"duration_seconds":self.options.duration,"warmup_seconds":self.options.warmup,"scenario":self.options.scenario,"reference_hz":self.options.target_hz,"reference_hz_source":"user/default threshold, not measured display refresh"},
-            "environment":{"window_level_requested":"always_on_top","initial_activation_requested":true,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"adapter":self.adapter,"present_mode":self.present_mode,"physical_width":self.width,"physical_height":self.height,"scale_factor":self.scale,"display_refresh_hz":"unavailable","validation_flags":self.validation_flags,"device_limits":self.limits,"timestamp_query_supported":self.timestamp_supported,"timestamp_query_requested":false},
+            "environment":{"window_level_requested":"always_on_top","initial_activation_requested":true,"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"adapter":self.adapter,"present_mode":self.present_mode,"physical_width":self.width,"physical_height":self.height,"scale_factor":self.scale,"display_refresh_hz":"unavailable","validation_flags":self.validation_flags,"device_limits":self.limits,"timestamp_query_supported":self.timestamp_supported,"timestamp_query_requested":gpu.requested,"timestamp_query_enabled":gpu.feature_enabled},
             "definitions":{"cadence":"time between returns from renderer, including atlas bookkeeping after present call; not physical display timing","cpu_times":"wall-clock durations of calls on render thread; submit/present are CPU call durations","draw_calls":"range: one geometry draw; text draw may be skipped by glyphon for empty glyphs","upload_bytes":"instance and viewport write_buffer bytes only; glyphon uploads unavailable","memory":"known buffers are instance and uniform only; depth texture bytes are logical width*height*4; glyphon resources, surface and driver allocations unavailable"},
-            "unavailable":{"gpu_execution_ms":"not measured","physical_present_latency_ms":"not measured","input_latency_ms":"not measured","cpu_usage":"not measured","rss":"not measured","allocations":"not measured","gpu_memory":"not measured"},
-            "startup":{"first_render_completion_ms":self.startup_elapsed_ms,"occluded_acquisitions":self.startup_occluded,"deadline_seconds":10},"retries":self.retries,"sample_limit":MAX_SAMPLES,"stage_ms_percentiles":stages,"statistics":stats(&intervals,self.options.target_hz).map_or_else(|| serde_json::json!("unavailable"), |value| serde_json::json!(value)),"last_frame":self.last_metrics.map_or_else(|| serde_json::json!("unavailable"), |frame| serde_json::json!(frame)),"raw_samples":self.samples,
+            "unavailable":{"physical_present_latency_ms":"not measured","input_latency_ms":"not measured","cpu_usage":"not measured","rss":"not measured","allocations":"not measured","gpu_memory":"not measured"},
+            "startup":{"first_render_completion_ms":self.startup_elapsed_ms,"occluded_acquisitions":self.startup_occluded,"deadline_seconds":10},"gpu_timing":{"scope":"elapsed GPU timestamp interval around canvas render pass; includes geometry and glyphon, may include preemption or overlap and is not exclusive GPU busy time; excludes uploads, resolve/copy, presentation and input latency", "report":gpu, "measurement_matched":gpu_values.len(), "measurement_frames":self.samples.len(), "measurement_coverage":if self.samples.is_empty() || !gpu.enabled { serde_json::json!("unavailable") } else { serde_json::json!(gpu_values.len() as f64 / self.samples.len() as f64) }, "statistics":gpu_stats,"statistics_unavailable_reason":gpu_reason},
+            "retries":self.retries,"sample_limit":MAX_SAMPLES,"stage_ms_percentiles":stages,"statistics":stats(&intervals,self.options.target_hz).map_or_else(|| serde_json::json!("unavailable"), |value| serde_json::json!(value)),"last_frame":self.last_metrics.map_or_else(|| serde_json::json!("unavailable"), |frame| serde_json::json!(frame)),"raw_samples":self.samples,
         });
         let json = serde_json::to_vec_pretty(&result)?;
         if let Some(path) = &self.options.output {
@@ -414,6 +480,24 @@ impl Benchmark {
                 );
             } else {
                 println!("cadence statistics unavailable: no valid samples");
+            }
+            if let Some(reason) = gpu_reason {
+                println!(
+                    "GPU render-pass interval unavailable: {reason}; coverage {}/{} frames",
+                    gpu_values.len(),
+                    self.samples.len()
+                );
+            } else {
+                let n = gpu_values.len();
+                let rank = |percent: usize| gpu_values[(n * percent).div_ceil(100) - 1];
+                println!(
+                    "GPU render-pass interval p50/p95/p99 {:.3}/{:.3}/{:.3} ms; coverage {}/{} frames",
+                    rank(50),
+                    rank(95),
+                    rank(99),
+                    n,
+                    self.samples.len()
+                );
             }
             if let Some(stages) = result["stage_ms_percentiles"].as_object() {
                 for (name, values) in stages {
@@ -533,6 +617,51 @@ mod tests {
         assert!((tail.one_percent_low_fps - 1000.0 / 30.0).abs() < 1e-12);
         assert!(stats(&[], 60).is_none());
         assert!(stats(&[0.0], 60).is_none());
+    }
+    #[test]
+    fn gpu_samples_join_by_frame_id_and_exclude_warmup() {
+        let sample = |frame_id| Sample {
+            elapsed_seconds: 1.0,
+            interval_ms: 16.0,
+            update_ms: 0.0,
+            frame: FrameMetrics {
+                frame_id,
+                ..FrameMetrics::default()
+            },
+        };
+        let gpu = [
+            desk_render::GpuSample {
+                frame_id: 9,
+                render_pass_ms: 5.0,
+            },
+            desk_render::GpuSample {
+                frame_id: 2,
+                render_pass_ms: 99.0,
+            },
+            desk_render::GpuSample {
+                frame_id: 5,
+                render_pass_ms: 3.0,
+            },
+        ];
+        assert_eq!(
+            gpu_measurement_values(&[sample(5), sample(9)], &gpu),
+            [3.0, 5.0]
+        );
+        assert_eq!(gpu_measurement_values(&[], &gpu), [] as [f64; 0]);
+    }
+    #[test]
+    fn gpu_percentiles_require_complete_trustworthy_coverage() {
+        let mut report = GpuReport::unavailable(true, true, "test");
+        assert!(gpu_statistics_unavailable_reason(&report, 2, 2, true).is_some());
+        report.enabled = true;
+        assert_eq!(gpu_statistics_unavailable_reason(&report, 2, 2, true), None);
+        assert!(gpu_statistics_unavailable_reason(&report, 2, 2, false).is_some());
+        assert!(gpu_statistics_unavailable_reason(&report, 2, 1, true).is_some());
+        report.invalid_timestamps_total = 1;
+        assert!(gpu_statistics_unavailable_reason(&report, 2, 2, true).is_some());
+        report.invalid_timestamps_total = 0;
+        report.pending_at_drain_end = 1;
+        assert!(gpu_statistics_unavailable_reason(&report, 2, 2, true).is_some());
     }
     #[test]
     fn warmup_cadence_excludes_boundary_interval() -> Result<()> {

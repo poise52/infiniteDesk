@@ -1,4 +1,7 @@
+mod gpu_timing;
 mod prepare;
+
+pub use gpu_timing::{GpuReport, GpuSample};
 
 use desk_core::{Camera, Scene, Viewport, WindowId};
 use glyphon::{
@@ -19,6 +22,8 @@ pub enum RenderError {
     Adapter(#[from] wgpu::RequestAdapterError),
     #[error("failed to create GPU device: {0}")]
     Device(#[from] wgpu::RequestDeviceError),
+    #[error("failed to create GPU device with requested timestamp queries: {0}")]
+    TimestampDevice(wgpu::RequestDeviceError),
     #[error("surface has no supported default configuration")]
     SurfaceConfiguration,
     #[error("GPU surface failed: {0}")]
@@ -42,6 +47,8 @@ pub enum FrameOutcome {
 
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct FrameMetrics {
+    pub frame_id: u64,
+    pub gpu_poll_ms: Option<f64>,
     pub acquire_ms: f64,
     pub geometry_ms: f64,
     pub upload_ms: f64,
@@ -104,6 +111,9 @@ pub struct Renderer {
     validation_flags: String,
     device_limits: String,
     timestamp_supported: bool,
+    timestamp_requested: bool,
+    frame_id: u64,
+    gpu_timer: Option<gpu_timing::GpuTimer>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -133,6 +143,7 @@ impl Renderer {
     pub async fn new(
         window: Arc<Window>,
         on_gpu_error: Arc<dyn Fn(String) + Send + Sync>,
+        timestamp_requested: bool,
     ) -> Result<Self, RenderError> {
         let size = window.inner_size();
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -149,9 +160,29 @@ impl Renderer {
         let adapter_info = format!("{:?}", adapter.get_info());
         let timestamp_supported = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         tracing::info!(adapter = %adapter_info, "selected GPU adapter");
+        let required_features = if timestamp_requested && timestamp_supported {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await?;
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features,
+                ..wgpu::DeviceDescriptor::default()
+            })
+            .await
+            .map_err(|error| {
+                if required_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+                    RenderError::TimestampDevice(error)
+                } else {
+                    RenderError::Device(error)
+                }
+            })?;
+        let gpu_timer = if required_features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            gpu_timing::GpuTimer::new(&device, &queue)
+        } else {
+            None
+        };
         let device_limits = format!("{:?}", device.limits());
         let on_uncaptured = Arc::clone(&on_gpu_error);
         device.on_uncaptured_error(Arc::new(move |error| {
@@ -272,6 +303,9 @@ impl Renderer {
             validation_flags,
             device_limits,
             timestamp_supported,
+            timestamp_requested,
+            frame_id: 0,
+            gpu_timer,
         };
         renderer.configure();
         Ok(renderer)
@@ -351,6 +385,23 @@ impl Renderer {
         self.size
     }
 
+    /// Collects pending timestamp readbacks outside the event loop with a bounded timeout.
+    pub fn finish_gpu_timing(&mut self) -> GpuReport {
+        self.gpu_timer.take().map_or_else(
+            || {
+                let reason = if !self.timestamp_requested {
+                    "not requested"
+                } else if !self.timestamp_supported {
+                    "adapter does not support TIMESTAMP_QUERY"
+                } else {
+                    "invalid timestamp period"
+                };
+                GpuReport::unavailable(self.timestamp_requested, self.timestamp_supported, reason)
+            },
+            |timer| timer.drain(&self.device, &self.queue, std::time::Duration::from_secs(2)),
+        )
+    }
+
     /// Prepares the first visible text layouts and glyphs before the initial redraw.
     ///
     /// # Errors
@@ -405,6 +456,13 @@ impl Renderer {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(FrameOutcome::Occluded);
         }
+        self.metrics.gpu_poll_ms = if let Some(timer) = &mut self.gpu_timer {
+            let start = Instant::now();
+            timer.poll(&self.device, &self.queue);
+            Some(ms(start))
+        } else {
+            None
+        };
         let mark = self.measure.then(Instant::now);
         let (frame, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => (frame, false),
@@ -424,6 +482,8 @@ impl Renderer {
                 return Err(RenderError::Frame("validation error"));
             }
         };
+        self.frame_id = self.frame_id.checked_add(1).ok_or(RenderError::Capacity)?;
+        self.metrics.frame_id = self.frame_id;
         if let Some(mark) = mark {
             self.metrics.acquire_ms = ms(mark);
         }
@@ -489,9 +549,18 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("canvas encoder"),
             });
+        let timing_slot = self
+            .gpu_timer
+            .as_mut()
+            .and_then(|timer| timer.reserve(self.frame_id));
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("canvas"),
+                timestamp_writes: timing_slot.and_then(|slot| {
+                    self.gpu_timer
+                        .as_ref()
+                        .map(|timer| timer.timestamp_writes(slot))
+                }),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -532,6 +601,11 @@ impl Renderer {
         }
         let mark = self.measure.then(Instant::now);
         self.queue.submit([command]);
+        if let Some(slot) = timing_slot
+            && let Some(timer) = &self.gpu_timer
+        {
+            timer.submitted(&self.queue, slot);
+        }
         if let Some(mark) = mark {
             self.metrics.submit_ms = ms(mark);
         }

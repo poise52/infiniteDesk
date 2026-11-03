@@ -90,6 +90,9 @@ impl ApplicationHandler<GpuError> for App {
                 Arc::new(move |message| {
                     let _ = proxy.send_event(GpuError(message));
                 }),
+                self.benchmark_options
+                    .as_ref()
+                    .is_some_and(|options| options.gpu_timestamps),
             ))?;
             let size = window.inner_size();
             self.board
@@ -516,7 +519,11 @@ fn main() -> Result<()> {
         if app.error.is_some() && benchmark.incomplete.is_none() {
             benchmark.incomplete = Some("render failed".into());
         }
-        benchmark.finish()?;
+        let gpu = app.renderer.as_mut().map_or_else(
+            || desk_render::GpuReport::unavailable(false, false, "renderer unavailable"),
+            desk_render::Renderer::finish_gpu_timing,
+        );
+        benchmark.finish(&gpu)?;
         if !benchmark.completed {
             anyhow::bail!(
                 "benchmark incomplete: {}",
