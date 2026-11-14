@@ -241,7 +241,7 @@ final class Canvas: NSView {
   override func keyDown(with e: NSEvent) { keyboard?(e, true) }
   override func keyUp(with e: NSEvent) { keyboard?(e, false) }
 }
-@MainActor final class ProbeDelegate: NSObject, NSApplicationDelegate {
+@MainActor final class ProbeDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   var window: NSWindow!
   let status = NSTextField(wrappingLabelWithString: "")
   let canvas = Canvas(frame: .zero)
@@ -249,6 +249,10 @@ final class Canvas: NSView {
   let context = CIContext(options: nil)
   let captureQueue = DispatchQueue(label: "stage6.capture")
   let axQueue = DispatchQueue(label: "stage6.ax")
+  var browser: Process?
+  var browserTitle: String?
+  var browserPressPending = false
+  var browserPressToken: FocusCancellation?
   var fixture: Process?
   var fixtureReader: FileHandle?
   var fixturePipeRead: FixturePipeRead?
@@ -300,20 +304,22 @@ final class Canvas: NSView {
   var focusDiagnostic = "AX text focus OFF"
   func applicationDidFinishLaunching(_ notification: Notification) {
     window = NSWindow(
-      contentRect: NSRect(x: 100, y: 100, width: 1100, height: 800),
+      contentRect: NSRect(x: 100, y: 100, width: 1280, height: 800),
       styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
     window.title = "InfiniteDesk Stage 6 Probe — experimental"
     window.isReleasedWhenClosed = false
+    window.delegate = self
     let root = NSView(frame: window.contentView!.bounds)
     root.autoresizingMask = [.width, .height]
     let stack = NSStackView()
     stack.orientation = .horizontal
     stack.spacing = 5
-    stack.frame = NSRect(x: 10, y: 755, width: 1080, height: 32)
+    stack.frame = NSRect(x: 10, y: 755, width: 1260, height: 32)
     stack.autoresizingMask = [.width, .minYMargin]
     for (title, action) in [
       ("Refresh status", #selector(refresh)), ("Request screen", #selector(requestScreen)),
       ("Request AX", #selector(requestAX)), ("Launch fixture", #selector(launchFixture)),
+      ("Launch browser", #selector(launchBrowser)),
       ("Start capture", #selector(startCapture)), ("Stop", #selector(stopCapture)),
       ("Input OFF", #selector(toggleInput)), ("Mouse CG", #selector(toggleMouseMode)),
       ("AX text OFF", #selector(toggleFocusMode)),
@@ -324,10 +330,10 @@ final class Canvas: NSView {
       stack.addArrangedSubview(button)
     }
     root.addSubview(stack)
-    status.frame = NSRect(x: 10, y: 630, width: 1080, height: 120)
+    status.frame = NSRect(x: 10, y: 630, width: 1260, height: 120)
     status.autoresizingMask = [.width, .minYMargin]
     root.addSubview(status)
-    canvas.frame = NSRect(x: 10, y: 10, width: 1080, height: 610)
+    canvas.frame = NSRect(x: 10, y: 10, width: 1260, height: 610)
     canvas.autoresizingMask = [.width, .height]
     root.addSubview(canvas)
     canvas.input = { [weak self] type, point in self?.sendMouse(type, point) }
@@ -355,6 +361,10 @@ final class Canvas: NSView {
     refresh()
   }
   @objc func launchFixture() {
+    guard browser?.isRunning != true else {
+      status.stringValue = "Close browser with Quit before launching fixture"
+      return
+    }
     guard fixture?.isRunning != true else {
       status.stringValue = "Fixture already running"
       return
@@ -363,6 +373,8 @@ final class Canvas: NSView {
       status.stringValue = "Stop the previous capture before launching a fixture"
       return
     }
+    browser = nil
+    browserTitle = nil
     fixtureReader?.readabilityHandler = nil
     fixtureReader = nil
     fixturePipeRead = nil
@@ -443,6 +455,21 @@ final class Canvas: NSView {
     if fixture?.isRunning == true { fixture?.terminate() }
     status.stringValue = reason
   }
+  func cancelBrowserPress() {
+    browserPressToken?.cancel()
+    browserPressToken = nil
+    browserPressPending = false
+  }
+  func validTarget() -> Bool {
+    if let browser {
+      guard browser.isRunning,
+        let app = NSRunningApplication(processIdentifier: browser.processIdentifier)
+      else { return false }
+      return app.bundleIdentifier == "com.google.Chrome"
+        && app.executableURL?.standardizedFileURL == browser.executableURL?.standardizedFileURL
+    }
+    return validFixture()
+  }
   func validFixture() -> Bool {
     guard let process = fixture, process.isRunning,
       let app = NSRunningApplication(processIdentifier: process.processIdentifier),
@@ -452,18 +479,23 @@ final class Canvas: NSView {
     return true
   }
   @objc func startCapture() {
-    guard !stopping, unknownStream == nil, !session.busy, validFixture(), let process = fixture
+    guard !stopping, unknownStream == nil, !session.busy,
+      let process = browser ?? fixture, validTarget()
     else {
       status.stringValue =
         "Start requires one running fixture and no active or unknown stream; retry Stop"
       return
     }
-    guard let windowID = handshake?.windowID, handshake?.expectedPID == process.processIdentifier,
-      handshake?.failed == false
+    guard
+      browser != nil
+        || (handshake?.windowID != nil
+          && handshake?.expectedPID == process.processIdentifier && handshake?.failed == false)
     else {
       status.stringValue = "Fixture window identity not ready"
       return
     }
+    let windowID = handshake?.windowID
+    let title = browserTitle
     let fixtureToken = fixtureGeneration
     guard CGPreflightScreenCaptureAccess() else {
       status.stringValue = "Screen Recording permission required"
@@ -483,7 +515,8 @@ final class Canvas: NSView {
           finishStartingCancellation()
           return
         }
-        guard fixtureGeneration == fixtureToken, validFixture(), fixture?.processIdentifier == pid,
+        guard fixtureGeneration == fixtureToken, validTarget(),
+          (browser ?? fixture)?.processIdentifier == pid, browserTitle == title,
           handshake?.windowID == windowID
         else {
           session.cancel()
@@ -491,15 +524,24 @@ final class Canvas: NSView {
           status.stringValue = "Fixture process or window identity changed"
           return
         }
-        let matches = matchingFixtureWindows(
-          content.windows, pid: pid, expectedPID: pid, windowID: windowID,
-          bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
-          id: { $0.windowID }, owner: { $0.owningApplication?.processID })
+        let matches: [SCWindow]
+        if let title {
+          matches = matchingBrowserWindows(
+            content.windows, pid: pid, title: title,
+            owner: { $0.owningApplication?.processID }, name: { $0.title })
+        } else if let windowID {
+          matches = matchingFixtureWindows(
+            content.windows, pid: pid, expectedPID: pid, windowID: windowID,
+            bundleID: NSRunningApplication(processIdentifier: pid)?.bundleIdentifier,
+            id: { $0.windowID }, owner: { $0.owningApplication?.processID })
+        } else {
+          matches = []
+        }
         guard matches.count == 1, let selected = matches.first else {
           session.cancel()
           starting = false
           status.stringValue =
-            "Fixture PID \(pid), window \(windowID): \(matches.isEmpty ? "not found in ScreenCaptureKit" : "duplicate ScreenCaptureKit IDs")"
+            "Target PID \(pid), window \(windowID.map(String.init) ?? title ?? "unknown"): \(matches.isEmpty ? "not found in ScreenCaptureKit" : "duplicate ScreenCaptureKit IDs")"
           return
         }
         let config = SCStreamConfiguration()
@@ -529,7 +571,7 @@ final class Canvas: NSView {
         }
         starting = false
         startTimer()
-        status.stringValue = "Capturing fixture PID \(pid), window \(selected.windowID); input OFF"
+        status.stringValue = "Capturing PID \(pid), window \(selected.windowID); input OFF"
       } catch {
         let startError = error
         if let candidateToStop { await stopStream(candidateToStop, frameOutput: candidateOutput) }
@@ -617,9 +659,9 @@ final class Canvas: NSView {
       invalidateFrame(error)
       return
     }
-    guard validFixture() else {
+    guard validTarget() else {
       stopCapture()
-      status.stringValue = "Fixture exited"
+      status.stringValue = "Target exited"
       return
     }
     if inputEnabled && axCheck.checkedAt != nil
@@ -640,7 +682,7 @@ final class Canvas: NSView {
       axDiagnostic = "stream callback inactive for 2 seconds; input disabled"
       updateGeometryStatus()
     }
-    requestAXGeometry()
+    if browser == nil { requestAXGeometry() }
     guard let frame, stream != nil, let target = targetWindow else { return }
     let full = CIImage(cvPixelBuffer: frame.buffer)
     let crop = CGRect(
@@ -664,7 +706,7 @@ final class Canvas: NSView {
     canvas.needsDisplay = true
     validateGeometry()
     frameDiagnostic =
-      "Fixture \(target.windowID) | frame \(CVPixelBufferGetWidth(frame.buffer))×\(CVPixelBufferGetHeight(frame.buffer)) | scale \(frame.scale), content scale \(frame.contentScale) | replaced \(dropped)\nInitial SCK window frame: \(target.frame) | contentRect: \(frame.content)"
+      "Target PID \(target.owningApplication?.processID ?? 0), window \(target.windowID), title \(browserTitle ?? "fixture") | frame \(CVPixelBufferGetWidth(frame.buffer))×\(CVPixelBufferGetHeight(frame.buffer)) | scale \(frame.scale), content scale \(frame.contentScale) | replaced \(dropped)\nInitial SCK window frame: \(target.frame) | contentRect: \(frame.content)"
     updateGeometryStatus()
   }
   func invalidateFrame(_ reason: String) {
@@ -748,6 +790,13 @@ final class Canvas: NSView {
       releaseInput()
       inputEnabled = false
       sender.title = "Input OFF"
+    } else if browser != nil && stream != nil && canvas.image != nil && validTarget()
+      && AXIsProcessTrusted() && NSApp.isActive && window.isKeyWindow
+      && streamActivityFresh(last: lastStreamActivity, now: ProcessInfo.processInfo.systemUptime)
+    {
+      inputEnabled = true
+      focusDiagnostic = "Browser AXPress enabled: click Press me"
+      updateGeometryStatus()
     } else if stream != nil && canvas.image != nil && canvas.sourceRect.width > 0 && validFixture()
       && AXIsProcessTrusted() && CGPreflightPostEventAccess()
     {
@@ -1022,6 +1071,10 @@ final class Canvas: NSView {
     return true
   }
   func sendMouse(_ type: CGEventType, _ point: CGPoint?) {
+    if browser != nil {
+      if type == .leftMouseDown, let point { pressBrowser(point) }
+      return
+    }
     guard permitted() else {
       releaseInput()
       if focusMode {
@@ -1093,8 +1146,17 @@ final class Canvas: NSView {
     postKey(event.keyCode, true, UInt64(event.modifierFlags.rawValue))
   }
   func releaseInput() {
+    cancelBrowserPress()
     if let point = pressed.mouseUp() { postMouse(.leftMouseUp, point) }
     for key in pressed.takeKeys() { postKey(key, false) }
+  }
+  func windowDidResignKey(_ notification: Notification) {
+    releaseInput()
+    inputEnabled = false
+    if stream != nil {
+      axDiagnostic = "probe window lost key status; input disabled"
+      updateGeometryStatus()
+    }
   }
   func applicationDidResignActive(_ notification: Notification) {
     if inputEnabled { axDiagnostic = "probe lost app focus; input disabled" }
@@ -1103,6 +1165,9 @@ final class Canvas: NSView {
     if stream != nil { updateGeometryStatus() }
   }
   func terminateFixture() {
+    if browser?.isRunning == true { browser?.terminate() }
+    browser = nil
+    browserTitle = nil
     fixtureGeneration += 1
     handshake = nil
     fixtureReader?.readabilityHandler = nil

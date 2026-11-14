@@ -2,12 +2,12 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 src="$root/native/macos/Stage6Probe"
-out="$root/target/native-probe"
+out="${1:-$root/target/native-probe}"
 mkdir -p "$out/build/module-cache" "$out/InfiniteDesk Fixture.app/Contents/MacOS" "$out/InfiniteDesk Probe.app/Contents/MacOS"
 cp "$src/Fixture.swift" "$out/build/main.swift"
 xcrun swiftc -module-cache-path "$out/build/module-cache" -swift-version 6 -warnings-as-errors -O -target arm64-apple-macosx15.0 "$src/Shared.swift" "$out/build/main.swift" -o "$out/InfiniteDesk Fixture.app/Contents/MacOS/Fixture"
 cp "$src/Probe.swift" "$out/build/main.swift"
-xcrun swiftc -module-cache-path "$out/build/module-cache" -swift-version 6 -warnings-as-errors -O -target arm64-apple-macosx15.0 "$src/Shared.swift" "$src/FocusExperiment.swift" "$out/build/main.swift" -o "$out/InfiniteDesk Probe.app/Contents/MacOS/Probe"
+xcrun swiftc -module-cache-path "$out/build/module-cache" -swift-version 6 -warnings-as-errors -O -target arm64-apple-macosx15.0 "$src/Shared.swift" "$src/FocusExperiment.swift" "$src/BrowserExperiment.swift" "$out/build/main.swift" -o "$out/InfiniteDesk Probe.app/Contents/MacOS/Probe"
 cp "$src/Tests.swift" "$out/build/main.swift"
 xcrun swiftc -module-cache-path "$out/build/module-cache" -swift-version 6 -warnings-as-errors -target arm64-apple-macosx15.0 "$src/Shared.swift" "$out/build/main.swift" -o "$out/build/tests"
 "$out/build/tests"

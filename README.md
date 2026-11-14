@@ -91,4 +91,11 @@ routing across dialogs remain open. The AppKit probe runs separately from the
 Rust/Metal canvas. Its local mouse monitor sees normal fixture dispatch and
 may miss events in nested tracking loops.
 
+**Launch browser** starts installed Google Chrome with a temporary profile and
+a local test page. Start capture, bring Probe to the front, turn Input on and
+click **Press me** in the preview. Probe checks whether the page updated its
+counter after the Accessibility action. On macOS 27.0.1 the capture worked
+but Chrome returned success for the action without a confirmed counter change.
+This experiment does not attach an existing Chrome window to the canvas.
+
 The probe keeps one latest-frame slot in memory and limits each accepted buffer to 32 MiB. It disables input after two seconds without a complete or idle capture callback. Recheck permission status after rebuilding either ad-hoc signed app.

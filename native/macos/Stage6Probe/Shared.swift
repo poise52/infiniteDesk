@@ -27,6 +27,27 @@ func matchingFixtureWindows<T>(
   return windows.filter { owner($0) == pid && id($0) == windowID }
 }
 
+func browserTitleCount(_ actual: String?, expected: String) -> UInt64? {
+  guard !expected.isEmpty, var actual else { return nil }
+  let suffix = " - Google Chrome"
+  if actual.hasSuffix(suffix) { actual.removeLast(suffix.count) }
+  if actual == expected { return 0 }
+  let prefix = expected + " · Pressed "
+  guard actual.hasPrefix(prefix) else { return nil }
+  let digits = actual.dropFirst(prefix.count)
+  guard !digits.isEmpty, digits.first != "0", digits.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+    let count = UInt64(digits), count <= 9_007_199_254_740_991
+  else { return nil }
+  return count
+}
+
+func matchingBrowserWindows<T>(
+  _ windows: [T], pid: Int32, title: String, owner: (T) -> Int32?, name: (T) -> String?
+) -> [T] {
+  guard pid > 0, !title.isEmpty else { return [] }
+  return windows.filter { owner($0) == pid && browserTitleCount(name($0), expected: title) != nil }
+}
+
 struct FixtureHandshake {
   enum Result: Equatable {
     case pending

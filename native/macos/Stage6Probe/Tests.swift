@@ -159,4 +159,46 @@ pressed.keyDown(7)
 check(
   pressed.keyUp(4) && !pressed.keyUp(4) && pressed.takeKeys() == Set([7])
     && pressed.takeKeys().isEmpty, "key release")
+
+struct BrowserWindow {
+  let pid: Int32
+  let title: String
+}
+let browserWindows = [
+  BrowserWindow(pid: 7, title: "nonce"), BrowserWindow(pid: 8, title: "nonce"),
+  BrowserWindow(pid: 7, title: "other"),
+]
+func browserMatches(_ windows: [BrowserWindow], pid: Int32, title: String) -> [BrowserWindow] {
+  matchingBrowserWindows(windows, pid: pid, title: title, owner: { $0.pid }, name: { $0.title })
+}
+check(browserMatches(browserWindows, pid: 7, title: "nonce").count == 1, "browser PID and title")
+check(browserMatches(browserWindows, pid: 7, title: "missing").isEmpty, "browser missing title")
+check(browserMatches(browserWindows, pid: 0, title: "nonce").isEmpty, "browser invalid PID")
+check(
+  browserMatches(browserWindows + [BrowserWindow(pid: 7, title: "nonce")], pid: 7, title: "nonce")
+    .count == 2, "browser duplicate identity")
+
+check(browserTitleCount("nonce", expected: "nonce") == 0, "browser initial title")
+check(browserTitleCount("nonce - Google Chrome", expected: "nonce") == 0, "browser initial suffix")
+check(browserTitleCount("nonce · Pressed 42", expected: "nonce") == 42, "browser pressed title")
+check(
+  browserTitleCount("nonce · Pressed 42 - Google Chrome", expected: "nonce") == 42,
+  "browser pressed suffix")
+for invalid in [
+  "nonce · Pressed -1", "nonce · Pressed +1", "nonce · Pressed 0", "nonce · Pressed 01",
+  "nonce · Pressed 1x", "nonce · Pressed 18446744073709551616", "nonce · Pressed 9007199254740992",
+  "nonce2 · Pressed 1", "nonce - Other", "nonce · Pressed 1 - Google Chrome extra",
+] {
+  check(browserTitleCount(invalid, expected: "nonce") == nil, "browser invalid title: \(invalid)")
+}
+check(browserTitleCount("", expected: "") == nil, "browser empty title")
+check(
+  browserTitleCount("nonce · Pressed 1", expected: "nonce")! > browserTitleCount(
+    "nonce", expected: "nonce")!, "browser first acknowledgement")
+check(
+  browserTitleCount("nonce · Pressed 2", expected: "nonce")! > browserTitleCount(
+    "nonce · Pressed 1", expected: "nonce")!, "browser repeated acknowledgement")
+check(
+  browserMatches([BrowserWindow(pid: 7, title: "nonce · Pressed 2")], pid: 7, title: "nonce").count
+    == 1, "browser restart after press")
 print("Stage6Probe pure tests passed")
