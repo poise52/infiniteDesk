@@ -4,18 +4,20 @@
 <meta charset="utf-8">
 <title>InfiniteDesk Chrome A</title>
 <style>
-body { font: 20px system-ui, sans-serif; margin: 36px; color: #18212a; }
-h1 { color: #146c94; font-size: 42px; }
+body { font: 22px system-ui, sans-serif; margin: 0; padding: 28px 36px; min-height: 100vh; box-sizing: border-box; color: #18212a; background: #d7f3ff; border-top: 18px solid #005476; }
+h1 { margin: 0 0 18px; color: #146c94; font-size: 52px; }
 label { display: block; margin: 24px 0; }
 input { display: block; width: 28em; max-width: 90%; font: inherit; padding: 8px; }
 output { overflow-wrap: anywhere; }
+#changed { display: inline-block; padding: 10px 16px; background: #fff; border: 3px solid currentColor; font-weight: 800; }
 </style>
 </head>
 <body>
 <h1>Chrome window A</h1>
 <p>This is the local fixture for window A.</p>
-<label>Target text <input id="target" value="TARGET-A" autocomplete="off"></label>
+<label>Target text <input id="target" autofocus value="TARGET-A" autocomplete="off"></label>
 <label>Neutral decoy <input id="decoy" value="DECOY-A" autocomplete="off"></label>
+<p><output id="changed">TARGET NOT EDITED</output></p>
 <p>Target value: <output id="value"></output></p>
 <p>Page visibility: <output id="visibility"></output>; page has focus: <output id="focus"></output></p>
 <script>
@@ -25,7 +27,10 @@ function refresh() {
   document.getElementById('visibility').textContent = document.visibilityState;
   document.getElementById('focus').textContent = String(document.hasFocus());
 }
-target.addEventListener('input', refresh);
+target.addEventListener('input', () => {
+  document.getElementById('changed').textContent = 'TARGET EDITED';
+  refresh();
+});
 document.addEventListener('visibilitychange', refresh);
 window.addEventListener('focus', refresh);
 window.addEventListener('blur', refresh);
