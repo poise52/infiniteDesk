@@ -1,6 +1,6 @@
 # InfiniteDesk
 
-Native macOS application for an infinite desktop. The demo renders and navigates a deterministic virtual-window scene in one Metal-backed canvas. Real-window integration is not implemented yet.
+InfiniteDesk is a native macOS canvas. The Finder app opens an interactive WebKit browser on the board. The command-line demo renders a deterministic scene of virtual windows for navigation and performance tests.
 
 ## Requirements
 
@@ -12,11 +12,14 @@ The deployment target is macOS 15.0; graphical behavior has been tested on macOS
 
 ## Run and verify
 
-On an Apple Silicon Mac, run `./scripts/build-macos-app.sh` and double-click
-`target/InfiniteDesk.app` in Finder. The demo opens with 1,000 virtual windows.
-Drag a window to move it, hold Space while dragging to move around the board,
-and use a trackpad pinch to zoom. Press F to see the whole scene and R to reset
-the camera.
+On an Apple Silicon Mac, run `./scripts/build-macos-app.sh` and open
+`target/InfiniteDesk.app` in Finder. Enter a URL in the address bar and press
+Return to visit a website. The browser opens Wikipedia on launch; Home returns
+to it. It has its own browsing session and does not import Safari or Chrome tabs.
+Drag the card by its title bar. Use the empty board to pan or zoom, or press
+Escape in the browser to return keyboard focus to the board. The browser runs
+inside InfiniteDesk and can be opened without screen recording or accessibility
+permissions. For the 1,000-window scene, use the `--demo` command below.
 
 Install the optional verification tools with:
 

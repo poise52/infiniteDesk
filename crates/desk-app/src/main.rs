@@ -5,6 +5,9 @@ use std::{
 
 use anyhow::{Context, Result};
 mod benchmark;
+#[cfg(all(target_os = "macos", feature = "native-browser"))]
+#[allow(unsafe_code)]
+mod browser;
 mod cli;
 mod interaction;
 
@@ -61,6 +64,10 @@ struct GpuError(String);
 
 struct App {
     board: Board,
+    #[cfg(all(target_os = "macos", feature = "native-browser"))]
+    browser_mode: browser::Mode,
+    #[cfg(all(target_os = "macos", feature = "native-browser"))]
+    browser: Option<browser::Browser>,
     startup_focus: bool,
     benchmark_options: Option<cli::Options>,
     benchmark: Option<benchmark::Benchmark>,
@@ -81,9 +88,14 @@ impl ApplicationHandler<GpuError> for App {
             return;
         }
         let result = (|| -> Result<_> {
-            let window = Arc::new(
-                event_loop.create_window(window_attributes(self.benchmark_options.is_some()))?,
-            );
+            let attributes = window_attributes(self.benchmark_options.is_some());
+            #[cfg(all(target_os = "macos", feature = "native-browser"))]
+            let attributes = if self.browser_mode == browser::Mode::Browser {
+                attributes.with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0))
+            } else {
+                attributes
+            };
+            let window = Arc::new(event_loop.create_window(attributes)?);
             let proxy = self.proxy.clone();
             let mut renderer = pollster::block_on(Renderer::new(
                 Arc::clone(&window),
@@ -118,6 +130,10 @@ impl ApplicationHandler<GpuError> for App {
             renderer.prewarm(&self.board.scene, self.board.camera, self.board.selected)?;
             if let Some(benchmark) = &mut self.benchmark {
                 benchmark.begin_after_init();
+            }
+            #[cfg(all(target_os = "macos", feature = "native-browser"))]
+            if self.browser_mode == browser::Mode::Browser {
+                self.browser = Some(browser::Browser::new(Arc::clone(&window))?);
             }
             Ok((window, renderer))
         })();
@@ -164,6 +180,10 @@ impl ApplicationHandler<GpuError> for App {
         }
         match event {
             WindowEvent::CloseRequested => {
+                #[cfg(all(target_os = "macos", feature = "native-browser"))]
+                {
+                    self.browser = None;
+                }
                 if let Some(benchmark) = &mut self.benchmark {
                     benchmark.incomplete = Some("window closed before completion".into());
                 }
@@ -340,6 +360,10 @@ impl ApplicationHandler<GpuError> for App {
                     self.board.tick(now);
                     0.0
                 };
+                #[cfg(all(target_os = "macos", feature = "native-browser"))]
+                if let Some(browser) = &mut self.browser {
+                    browser.update(&self.board);
+                }
                 match renderer.render(&self.board.scene, self.board.camera, self.board.selected) {
                     Ok(FrameOutcome::Retry) => {
                         if let Some(benchmark) = &mut self.benchmark {
@@ -481,16 +505,34 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let options = match cli::parse(std::env::args_os().skip(1)).map_err(anyhow::Error::msg)? {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(all(target_os = "macos", feature = "native-browser"))]
+    let browser_mode = args.is_empty() && browser::is_bundle_demo();
+    let options = match cli::parse(args).map_err(anyhow::Error::msg)? {
         cli::Command::Help => {
             print!("{}", cli::HELP);
             return Ok(());
         }
         cli::Command::Run(options) => options,
     };
+    #[cfg(all(target_os = "macos", feature = "native-browser"))]
+    let scene = if browser_mode {
+        browser::scene()?
+    } else {
+        interaction::clustered_demo(options.windows, options.seed)?
+    };
+    #[cfg(not(all(target_os = "macos", feature = "native-browser")))]
     let scene = interaction::clustered_demo(options.windows, options.seed)?;
     let camera = Camera::new(WorldPoint::new(0.0, 0.0)?, 1.0)?;
-    let board = Board::new(scene, camera, Some(WindowId(options.focus.unwrap_or(11))));
+    #[cfg(all(target_os = "macos", feature = "native-browser"))]
+    let selected = if browser_mode {
+        0
+    } else {
+        options.focus.unwrap_or(11)
+    };
+    #[cfg(not(all(target_os = "macos", feature = "native-browser")))]
+    let selected = options.focus.unwrap_or(11);
+    let board = Board::new(scene, camera, Some(WindowId(selected)));
     if options.mode == cli::Mode::Microbench {
         return benchmark::microbench(&options, board);
     }
@@ -499,6 +541,14 @@ fn main() -> Result<()> {
         .context("failed to create event loop")?;
     let mut app = App {
         board,
+        #[cfg(all(target_os = "macos", feature = "native-browser"))]
+        browser_mode: if browser_mode {
+            browser::Mode::Browser
+        } else {
+            browser::Mode::Board
+        },
+        #[cfg(all(target_os = "macos", feature = "native-browser"))]
+        browser: None,
         startup_focus: options.focus.is_some(),
         benchmark_options: (options.mode == cli::Mode::Benchmark).then_some(options),
         benchmark: None,

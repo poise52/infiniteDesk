@@ -12,12 +12,14 @@ app="$target/InfiniteDesk.app"
 builds="$target/InfiniteDesk-builds"
 mkdir -p "$builds"
 cd "$root"
-cargo build --manifest-path "$root/Cargo.toml" --target-dir "$target" --release --locked -p desk-app -j 2
+cargo build --manifest-path "$root/Cargo.toml" --target-dir "$target" --release --locked -p desk-app --features native-browser -j 2
 
 build=$(mktemp -d "$builds/build.XXXXXX")
 bundle="$build/InfiniteDesk.app"
-mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
+mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" "$bundle/Contents/Frameworks"
 cp "$target/release/desk-app" "$bundle/Contents/MacOS/InfiniteDesk"
+cp "$target/release/libDeskBrowser.dylib" "$bundle/Contents/Frameworks/libDeskBrowser.dylib"
+codesign --force --sign - "$bundle/Contents/Frameworks/libDeskBrowser.dylib"
 printf 'InfiniteDesk local demo bundle\n' > "$bundle/Contents/Resources/build-marker.txt"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
