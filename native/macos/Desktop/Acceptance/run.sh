@@ -1,0 +1,34 @@
+#!/bin/sh
+set -eu
+case "${1-}" in --check|--run) ;; *) echo 'Usage: run.sh --check | --run' >&2; exit 2 ;; esac
+[ "$#" -eq 1 ] || exit 2
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH= cd -- "$here/../../../.." && pwd)
+build="$root/target/desktop-acceptance"
+bundle="$build/InfiniteDesk Acceptance.app"
+fingerprint=$(shasum -a 256 "$here/Driver.swift" "$here/Info.plist" | shasum -a 256 | awk '{print $1}')
+current=''
+if [ -r "$build/build-fingerprint" ]; then current=$(cat "$build/build-fingerprint"); fi
+if [ "$fingerprint" != "$current" ] || [ ! -x "$bundle/Contents/MacOS/Driver" ]; then
+  if [ "$1" = --run ]; then
+    echo 'Acceptance bundle is missing or sources changed. Run --check and review its Accessibility grant before --run.' >&2
+    exit 1
+  fi
+  mkdir -p "$build/module-cache" "$bundle/Contents/MacOS"
+  xcrun swiftc -swift-version 6 -warnings-as-errors -target "$(uname -m)-apple-macosx15.0" \
+    -module-cache-path "$build/module-cache" "$here/Driver.swift" -o "$bundle/Contents/MacOS/Driver"
+  cp "$here/Info.plist" "$bundle/Contents/Info.plist"
+  plutil -lint "$bundle/Contents/Info.plist"
+  codesign --force --sign - --timestamp=none --identifier org.infinitedesk.tests.desktop-acceptance "$bundle"
+  printf '%s\n' "$fingerprint" > "$build/build-fingerprint"
+else
+  echo 'Reusing unchanged acceptance bundle.'
+fi
+codesign --verify --strict "$bundle"
+sh -n "$here/driver-command.sh"
+node --check "$here/run.mjs"
+if [ "$1" = --check ]; then
+  printf 'Acceptance bundle verified: %s\nNo GUI or permissions check was performed.\n' "$bundle"
+  exit 0
+fi
+exec node "$here/run.mjs" "$here/driver-command.sh"

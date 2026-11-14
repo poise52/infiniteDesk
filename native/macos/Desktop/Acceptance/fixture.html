@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>InfiniteDesk Desktop Fixture</title>
+<style>
+  body { margin: 32px; color: #12232b; background: #d8f2fa; font: 22px system-ui; }
+  body[data-id="B"] { background: #f9e2cf; }
+  h1 { font-size: 44px; }
+  input { display: block; padding: 10px; font: inherit; width: 80%; }
+  output { overflow-wrap: anywhere; }
+</style>
+<h1></h1><label>Target text <input id="target" autofocus autocomplete="off"></label>
+<p>DOM value: <output id="value"></output></p><p>Input events: <output id="count">0</output></p>
+<label>Untouched decoy <input id="decoy" autocomplete="off"></label>
+<script>
+  const id = new URL(location.href).searchParams.get('id');
+  if (!['A', 'B'].includes(id)) throw new Error('Expected fixture ID');
+  document.title = `InfiniteDesk Desktop Fixture ${id}`;
+  document.body.dataset.id = id;
+  document.querySelector('h1').textContent = `Original Chrome ${id}`;
+  const target = document.querySelector('#target');
+  target.value = `TARGET-${id}`;
+  document.querySelector('#decoy').value = `DECOY-${id}`;
+  let count = 0;
+  function update() {
+    document.querySelector('#value').textContent = target.value;
+    document.querySelector('#count').textContent = count;
+  }
+  target.addEventListener('input', () => { count += 1; update(); });
+  update();
+</script></html>

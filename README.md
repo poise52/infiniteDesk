@@ -3,21 +3,44 @@
 > [!WARNING]
 > **Do not download or install InfiniteDesk.** The project is unfinished. The build instructions below are for development and testing only.
 
-InfiniteDesk aims to manage real application windows directly on the macOS desktop. In the planned desktop mode, selecting a visible window will keep its size and position, and dragging its title bar will update its place on the infinite canvas.
+InfiniteDesk is a macOS menu bar app for registering and focusing real application windows. Registration reads the focused window where it is. You can then switch between registered windows, including two windows belonging to the same app. This first desktop mode keeps registrations for the current session. Panning between distant windows and the zoomed-out overview are planned.
 
-The current prototype opens a separate board window. A card can move an application's window over the board, but the window keeps its own title bar and can be dragged away from the card. A card can also host an embedded WebKit browser or show a live preview. The command-line demo renders virtual windows for navigation and performance tests.
+## Build and try the desktop manager
 
-## Requirements
+Build on an Apple Silicon Mac with Xcode or Apple Command Line Tools that support Swift 6. The minimum deployment target is macOS 15.
 
-- macOS 15.0 or later on Apple Silicon with a Metal-capable GPU
-- Rust 1.99.1, installed automatically by rustup from `rust-toolchain.toml`
-- Apple Command Line Tools or Xcode
+```sh
+./scripts/build-macos-app.sh
+open target/InfiniteDesk.app
+```
 
-The deployment target is macOS 15.0; graphical behavior has been tested on macOS 27.0.1, not yet on 15.0. Full Xcode and Instruments are required for profiling; the Command Line Tools alone do not provide them.
+Open the InfiniteDesk icon in the menu bar and grant Accessibility access when requested. For local development, set `INFINITEDESK_SIGN_IDENTITY` to your Apple Development signing identity before building if you want a consistent signing identity across builds. The default is an ad-hoc signature, so macOS may request permission again after rebuilding.
 
-## Run and verify
+1. Focus a window and press **⌃⌥⌘W** to register it. Repeat with a second window.
+2. Press **⌃⌥⌘←** or **⌃⌥⌘→** to focus the previous or next registered window. Type directly in the original application.
+3. To choose a specific registration, use the InfiniteDesk menu. The menu also shows the latest operation and any shortcut conflicts.
 
-Build with `./scripts/build-macos-app.sh` and open `target/InfiniteDesk.app`.
+Run the desktop checks without opening windows or granting Accessibility access:
+
+```sh
+native/macos/Desktop/Tests/run.sh
+native/macos/Desktop/Acceptance/run.sh --check
+```
+
+CI builds the desktop bundle and runs both checks. For the opt-in live test,
+follow the [desktop acceptance instructions](native/macos/Desktop/Acceptance/README.md)
+and run `native/macos/Desktop/Acceptance/run.sh --run` in a graphical session
+with the documented permissions. Headless checks do not verify live window focus.
+
+## Board prototype and benchmarks
+
+The earlier board prototype is a separate development app. It needs Rust 1.99.1 (selected by `rust-toolchain.toml`) and a Metal-capable GPU. Graphical board checks ran on macOS 27.0.1. Full Xcode and Instruments are required for profiling.
+
+```sh
+./scripts/build-macos-app.sh --board
+open "target/InfiniteDesk Board.app"
+```
+
 Two empty cards open side by side. Click **Use real window…** in a card,
 choose a running app and select its window. With Accessibility access,
 InfiniteDesk places the original window over the card and gives it focus.
@@ -114,7 +137,7 @@ Controls:
 
 Close the native window to exit. The canvas redraws on demand and reconfigures its surface after a resize.
 
-`desk-app` owns the event loop and window lifecycle; `desk-render` owns GPU resources. `desk-core` provides validated f64 world geometry, logical and physical coordinate conversion, a camera, and deterministic virtual window scenes. World coordinates are limited to ±1e12, zoom to 1e-7–100 logical pixels per world unit, and display scale to 0.25–16; these are application limits rather than macOS limits. At 1e12, f64 quantization is about 0.000122 world units. Rectangle edges are half-open; edge contact does not count as overlap. A zero-sized viewport is rejected, so callers skip viewport operations when minimized. The Finder app displays the selected window through a native layer. The board supports the Chrome field replacement described above. The separate macOS probe also exercises pointer and caret input against a test fixture. Titles use bundled IBM Plex Mono, with its license and provenance in `crates/desk-render/assets/`. Glyphs not supported by the bundled font may be unavailable. Text layouts are cached only for visible titles, so a title returning on-screen may be reshaped; new scales can also rasterize glyphs on redraw. Total font-cache memory and frame latency have not yet been measured. GPU behavior and native window interaction require a real graphical macOS session; CI checks do not exercise them. A lost GPU device causes a graceful exit; device recovery is deferred to a later renderer milestone.
+`desk-app` owns the event loop and window lifecycle; `desk-render` owns GPU resources. `desk-core` provides validated f64 world geometry, logical and physical coordinate conversion, a camera, and deterministic virtual window scenes. World coordinates are limited to ±1e12, zoom to 1e-7–100 logical pixels per world unit, and display scale to 0.25–16; these are application limits rather than macOS limits. At 1e12, f64 quantization is about 0.000122 world units. Rectangle edges are half-open; edge contact does not count as overlap. A zero-sized viewport is rejected, so callers skip viewport operations when minimized. The board prototype displays the selected window through a native layer. The board supports the Chrome field replacement described above. The separate macOS probe also exercises pointer and caret input against a test fixture. Titles use bundled IBM Plex Mono, with its license and provenance in `crates/desk-render/assets/`. Glyphs not supported by the bundled font may be unavailable. Text layouts are cached only for visible titles, so a title returning on-screen may be reshaped; new scales can also rasterize glyphs on redraw. Total font-cache memory and frame latency have not yet been measured. GPU behavior and native window interaction require a real graphical macOS session; CI checks do not exercise them. A lost GPU device causes a graceful exit; device recovery is deferred to a later renderer milestone.
 
 The text stack currently depends on `ttf-parser` 0.25.1, which is unmaintained ([RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192)); the font database loads only the bundled trusted font. It also uses `lru` 0.16.4, affected by [RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253); glyphon uses Copy keys and `pop_lru`, while the advisory requires `pop` with a panicking key destructor. Both advisory-specific cargo-deny exceptions must be reviewed when upstream dependencies change and removed when replacements are available. `cargo audit` continues to report both warnings.
 

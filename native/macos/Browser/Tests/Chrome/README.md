@@ -7,7 +7,7 @@ use the user's Chrome profile, remote debugging, Accessibility grants, or input
 injection. `--disable-background-networking` reduces Chrome background activity;
 it is not a network isolation guarantee.
 
-1. Build and open `target/InfiniteDesk.app` using the repository README. Allow
+1. Build with `./scripts/build-macos-app.sh --board` and open `target/InfiniteDesk Board.app`. Allow
    the permissions normally required for screen capture and window focus. The
    ⌘Return operation requires macOS 15.2 or later and Accessibility access for
    InfiniteDesk.
