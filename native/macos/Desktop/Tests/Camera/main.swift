@@ -17,6 +17,13 @@ final class CameraAX: DesktopCameraAXAccess {
   var windows: [AXUIElement] = []
   var frames = [CGRect(x: 72, y: 110, width: 620, height: 470), CGRect(x: 400, y: 230, width: 650, height: 490)]
   var minimized = [false, false]
+  var roles = [kAXWindowRole, kAXWindowRole]
+  var subroles: [String?] = [kAXStandardWindowSubrole, kAXStandardWindowSubrole]
+  var useParkedSubrole = false
+  var parkedSubrole: String? = kAXDialogSubrole
+  var delayedStandardSubroleReads = 0
+  var sheets: [AXUIElement] = []
+  var reportedPID: pid_t? = 41000
   var writes: [(Int, Bool)] = []
   var positionWrites: [(Int, CGPoint)] = []
   var positionWritable = false
@@ -26,6 +33,10 @@ final class CameraAX: DesktopCameraAXAccess {
   var focusOnRestore: AXUIElement?
   var afterRestore: (() -> Void)?
   var positionReads = 0
+  var attributeRoundTrips = 0
+  var batchRequests = 0
+  var batchEnabled = true
+  var afterBatch: (([String]) -> Void)?
   var refuse = false
   var fullScreen = [false, false]
   var writable = true
@@ -39,8 +50,29 @@ final class CameraAX: DesktopCameraAXAccess {
   func index(_ element: AXUIElement) -> Int { CFEqual(element, a) ? 0 : 1 }
   func application(pid: pid_t) -> AXUIElement { app }
   func timeout(_ element: AXUIElement) -> Bool { true }
-  func pid(_ element: AXUIElement) -> pid_t? { 41000 }
+  func pid(_ element: AXUIElement) -> pid_t? { reportedPID }
   func read(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    attributeRoundTrips += 1
+    return attributeValue(element, name)
+  }
+  func readMultiple(_ element: AXUIElement, _ names: [String], _ operation: DesktopOperation) throws -> [CFTypeRef?] {
+    guard batchEnabled else {
+      return try names.map { name in
+        try operation.check()
+        let value = read(element, name)
+        try operation.check()
+        return value
+      }
+    }
+    try operation.check()
+    attributeRoundTrips += 1
+    batchRequests += 1
+    let values = names.map { attributeValue(element, $0) }
+    afterBatch?(names)
+    try operation.check()
+    return values
+  }
+  private func attributeValue(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
     if transientFailures[name, default: 0] > 0 {
       transientFailures[name, default: 0] -= 1
       return nil
@@ -52,8 +84,15 @@ final class CameraAX: DesktopCameraAXAccess {
     }
     let index = index(element)
     switch name {
-    case kAXRoleAttribute: return kAXWindowRole as CFString
-    case kAXSubroleAttribute: return kAXStandardWindowSubrole as CFString
+    case kAXRoleAttribute: return roles[index] as CFString
+    case kAXSubroleAttribute:
+      if minimized[index] && useParkedSubrole { return parkedSubrole.map { $0 as CFString } }
+      if delayedStandardSubroleReads > 0 {
+        delayedStandardSubroleReads -= 1
+        return kAXDialogSubrole as CFString
+      }
+      return subroles[index].map { $0 as CFString }
+    case "AXSheets": return sheets as CFArray
     case kAXTitleAttribute: return "Same title" as CFString
     case kAXMinimizedAttribute: return minimized[index] ? kCFBooleanTrue : kCFBooleanFalse
     case "AXFullScreen": return fullScreen[index] ? kCFBooleanTrue : kCFBooleanFalse
@@ -221,9 +260,13 @@ try panBackend.queue.sync {
   expect(panAX.positionWrites.count == 2 && panAX.writes.isEmpty && panAX.focusWrites == 0, "Visible pan moves positions without minimizing or focusing")
   let durable = panJournal.durableCommitCount
   let readsBeforeTicks = panAX.positionReads
+  let roundTripsBeforeTicks = panAX.attributeRoundTrips
+  let batchesBeforeTicks = panAX.batchRequests
   for _ in 0..<200 { _ = try panBackend.panCamera(by: 0.125, display: display, operation: operation) }
   expect(panJournal.durableCommitCount == durable, "Continuous movement cannot fsync per input tick")
   expect(panAX.positionReads - readsBeforeTicks == 800, "Each visible window uses one candidate frame sample plus fresh post-write readback per batch")
+  expect(panAX.attributeRoundTrips - roundTripsBeforeTicks == 2400 && panAX.batchRequests - batchesBeforeTicks == 1600,
+    "Each visible window keeps both exact identity checks and two frame samples using six attribute round trips")
   let reversed = try panBackend.panCamera(by: -70.25, ended: true, display: display, operation: operation)
   expect(reversed.origin.x == 55.25, "Quick reversal must retain exact accumulated fractional origin")
   let writeCount = panAX.positionWrites.count
@@ -276,6 +319,37 @@ try panBackend.queue.sync {
   expect(panJournal.entries.isEmpty, "Owner unminimization allows explicit recovery to finish")
 }
 print("Continuous camera tests passed: fractional AX projection, bounded disk writes, reversal, end audit, native clipping, drag recovery, parking, Pause/Resume, page interoperability.")
+
+let overviewAX = CameraAX()
+overviewAX.positionWritable = true
+let overviewBackend = DesktopWindowBackend(access: overviewAX, observationProvider: NoObserver(), permissionCheck: { true },
+  cameraJournal: try DesktopCameraJournal(fileURL: folder.appendingPathComponent("overview.json")),
+  onCurrentSpace: { _, _ in true }, processIdentity: { _ in birth })
+try overviewBackend.queue.sync {
+  let operation = DesktopOperation(timeout: 10)
+  overviewBackend.setFrontmost(pid: app.pid)
+  let a = try overviewBackend.capture(application: app, operation: operation)
+  try overviewBackend.commit(id: a.id, operation: operation)
+  overviewAX.focused = overviewAX.b
+  let b = try overviewBackend.capture(application: app, operation: operation)
+  try overviewBackend.commit(id: b.id, operation: operation)
+  _ = try overviewBackend.moveFocusedToNewPage(display: display, operation: operation)
+  let before = overviewBackend.state().windows.map(\.worldFrame)
+  let writes = overviewAX.positionWrites.count
+  try overviewBackend.reveal(id: b.id, display: display, operation: operation, fromOverview: true)
+  expect(overviewAX.positionWrites.count == writes && overviewBackend.state().camera.origin.x == 1920,
+    "Overview selection of an already visible original must not move the camera")
+  try overviewBackend.reveal(id: a.id, display: display, operation: operation, fromOverview: true)
+  expect(overviewBackend.state().camera.origin.x == a.originalFrame.minX && !overviewAX.minimized[0],
+    "Returning to the parked window from the right only reveals its left edge to the start of the display")
+  try overviewBackend.reveal(id: b.id, display: display, operation: operation, fromOverview: true)
+  expect(overviewBackend.state().camera.origin.x == before[1].maxX - display.visibleFrame.maxX && !overviewAX.minimized[1],
+    "Returning from the left reveals the exact chosen window at the opposite edge")
+  expect(overviewBackend.state().windows.map(\.worldFrame) == before, "Overview navigation must preserve world coordinates")
+  _ = try overviewBackend.setCameraPaused(true, display: display, operation: operation)
+  expect(overviewAX.frames == [a.originalFrame,b.originalFrame], "Pause must restore both originals after overview navigation")
+}
+print("Overview navigation tests passed: visible selection, minimal reveal from either side, stable world frames and restoration.")
 
 @MainActor
 func verifyClientCoalescing() async throws {
@@ -332,7 +406,7 @@ final class FocusInputGeneration: @unchecked Sendable {
   func read() -> UInt64 { lock.lock(); defer { lock.unlock() }; return value }
   func advance() { lock.lock(); value += 1; lock.unlock() }
 }
-func verifyUnparkFocus(takeover: Bool, foreign: Bool, active: Bool) throws {
+func verifyUnparkFocus(takeover: Bool, foreign: Bool, active: Bool, pause: Bool = false, changedFrontmost: Bool = false) throws {
   let store = try DesktopCameraJournal(fileURL: folder.appendingPathComponent("focus-recovery-\(UUID()).json"))
   let adapter = CameraAX()
   adapter.positionWritable = true
@@ -349,15 +423,26 @@ func verifyUnparkFocus(takeover: Bool, foreign: Bool, active: Bool) throws {
     _ = try worker.moveFocusedToNewPage(display: display, operation: operation)
     expect(adapter.minimized == [true, false], "Focus fixture must park only A while B remains focused")
     adapter.focusOnRestore = foreign ? adapter.foreign : adapter.a
-    if takeover { adapter.afterRestore = { generation.advance() } }
-    _ = try worker.panCamera(by: -1420, ended: true, display: display, operation: operation)
-    let repairExpected = active && !takeover && !foreign
+    adapter.afterRestore = {
+      if takeover { generation.advance() }
+      if changedFrontmost { worker.setFrontmost(pid: app.pid + 1) }
+    }
+    if pause {
+      _ = try worker.setCameraPaused(true, display: display, operation: operation)
+      expect(adapter.minimized == [false, false] && store.entries.isEmpty,
+        "Pause must release parked A while retaining physically visible B")
+    } else {
+      _ = try worker.panCamera(by: -1420, ended: true, display: display, operation: operation)
+    }
+    let repairExpected = active && !takeover && !foreign && !changedFrontmost
     expect(adapter.focusWrites == (repairExpected ? 1 : 0), "Only proven system displacement can trigger one sibling focus repair")
     if repairExpected {
       expect(CFEqual(adapter.focused!, adapter.b) && worker.state().focusedID == b.id, "Native auto-focus on arriving A must return to the exact previously focused B")
-      adapter.focusOnRestore = nil
-      _ = try worker.panCamera(by: 1, display: display, operation: operation)
-      expect(adapter.focusWrites == 1, "Normal continuous position ticks must never perform focus actions")
+      if !pause {
+        adapter.focusOnRestore = nil
+        _ = try worker.panCamera(by: 1, display: display, operation: operation)
+        expect(adapter.focusWrites == 1, "Normal continuous position ticks must never perform focus actions")
+      }
     } else {
       expect(CFEqual(adapter.focused!, foreign ? adapter.foreign : adapter.a), "User takeover and third-party focus changes must be preserved")
     }
@@ -370,3 +455,247 @@ try verifyUnparkFocus(takeover: true, foreign: false, active: true)
 try verifyUnparkFocus(takeover: false, foreign: true, active: true)
 try verifyUnparkFocus(takeover: false, foreign: false, active: false)
 print("Continuous unpark focus tests passed: exact sibling preservation, zero per-tick focus, no third-party/takeover/background focus stealing.")
+try verifyUnparkFocus(takeover: false, foreign: false, active: true, pause: true)
+try verifyUnparkFocus(takeover: true, foreign: false, active: true, pause: true)
+try verifyUnparkFocus(takeover: false, foreign: true, active: true, pause: true)
+try verifyUnparkFocus(takeover: false, foreign: false, active: false, pause: true)
+try verifyUnparkFocus(takeover: false, foreign: false, active: true, pause: true, changedFrontmost: true)
+print("Pause unpark focus tests passed: visible exact sibling retained; no repair after user takeover, foreign focus, inactive app or frontmost PID change.")
+
+#if DESKTOP_AX_BATCH_EXPERIMENT
+var attributeError = AXError.attributeUnsupported
+let errorValue = AXValueCreate(.axError, &attributeError)!
+let decoded = SystemDesktopAXAccess.multipleValues(
+  [kAXWindowRole as CFString, kCFNull!, errorValue, kCFBooleanFalse!] as CFArray, count: 4)
+expect(decoded[0] as? String == kAXWindowRole && decoded[1] == nil && decoded[2] == nil && decoded[3] as? Bool == false,
+  "Native batch errors and CFNull must preserve attribute positions without becoming successful values")
+expect(SystemDesktopAXAccess.multipleValues(nil, count: 2).allSatisfy { $0 == nil }
+  && SystemDesktopAXAccess.multipleValues([kCFBooleanFalse!] as CFArray, count: 2).allSatisfy { $0 == nil },
+  "Missing or truncated native batches must fail every requested attribute")
+#endif
+
+final class CameraSafetyState: @unchecked Sendable {
+  private let lock = NSLock()
+  private var permission = true
+  private var identity = birth
+  func permitted() -> Bool { lock.lock(); defer { lock.unlock() }; return permission }
+  func process() -> DesktopProcessIdentity { lock.lock(); defer { lock.unlock() }; return identity }
+  func revoke() { lock.lock(); permission = false; lock.unlock() }
+  func restorePermission() { lock.lock(); permission = true; lock.unlock() }
+  func replaceProcess() { lock.lock(); identity = .init(seconds: 3, microseconds: 4); lock.unlock() }
+}
+
+func verifyBatchedSafety(_ scenario: String) throws {
+  let adapter = CameraAX()
+  adapter.positionWritable = true
+  let safety = CameraSafetyState()
+  let store = try DesktopCameraJournal(fileURL: folder.appendingPathComponent("batch-safety-\(UUID()).json"))
+  let worker = DesktopWindowBackend(access: adapter, observationProvider: NoObserver(),
+    permissionCheck: { safety.permitted() }, cameraJournal: store,
+    onCurrentSpace: { _, _ in true }, processIdentity: { _ in safety.process() })
+  try worker.queue.sync {
+    let operation = DesktopOperation(timeout: 20)
+    worker.setFrontmost(pid: app.pid)
+    let selected = try worker.capture(application: app, operation: operation)
+    try worker.commit(id: selected.id, operation: operation)
+    _ = try worker.panCamera(by: 5, display: display, operation: operation)
+    let before = adapter.positionWrites.count
+    switch scenario {
+    case "permission": safety.revoke()
+    case "Space": worker.invalidateCameraScope()
+    case "membership": adapter.windows = [adapter.b, adapter.foreign]
+    case "prewrite-membership", "prewrite-process", "prewrite-partial":
+      adapter.afterBatch = { names in
+        guard names == [kAXPositionAttribute, kAXSizeAttribute] else { return }
+        adapter.afterBatch = nil
+        switch scenario {
+        case "prewrite-membership": adapter.windows = [adapter.b, adapter.foreign]
+        case "prewrite-process": safety.replaceProcess()
+        default: adapter.transientFailures[kAXRoleAttribute] = 1
+        }
+      }
+    default: adapter.transientFailures[scenario] = 1
+    }
+    if ["permission", "Space", "prewrite-membership", "prewrite-process", "prewrite-partial"].contains(scenario) {
+      failure { _ = try worker.panCamera(by: 5, display: display, operation: operation) }
+    } else {
+      _ = try worker.panCamera(by: 5, display: display, operation: operation)
+      expect(worker.state().windows.first!.availability == .unavailable, "Partial sample or changed membership must mark the exact window unavailable")
+    }
+    expect(adapter.positionWrites.count == before && adapter.writes.isEmpty,
+      "\(scenario) must block every native mutation without falling back to a same-title sibling")
+    expect(!store.entries.isEmpty, "\(scenario) cannot discard existing position restoration ownership")
+    adapter.windows = [adapter.a, adapter.b, adapter.foreign]
+    safety.restorePermission()
+    if scenario == "prewrite-process" {
+      failure { _ = try worker.setCameraPaused(true, display: display, operation: operation) }
+      expect(!store.entries.isEmpty && adapter.positionWrites.count == before,
+        "Process replacement must retain manual recovery and refuse restoration to a reused PID")
+    } else {
+      _ = try worker.setCameraPaused(true, display: display, operation: operation)
+      expect(store.entries.isEmpty && adapter.frames[0] == CGRect(x: 72, y: 110, width: 620, height: 470),
+        "\(scenario) must still restore the exact registered original after its safety gate recovers")
+    }
+  }
+}
+for scenario in ["permission", "Space", "membership", "prewrite-membership", "prewrite-process", "prewrite-partial",
+  kAXRoleAttribute, kAXSubroleAttribute, "AXFullScreen", kAXMinimizedAttribute, kAXPositionAttribute, kAXSizeAttribute] {
+  try verifyBatchedSafety(scenario)
+}
+
+func attributeTripsForPan(batchEnabled: Bool) throws -> Int {
+  let adapter = CameraAX()
+  adapter.batchEnabled = batchEnabled
+  adapter.positionWritable = true
+  let store = try DesktopCameraJournal(fileURL: folder.appendingPathComponent("batch-count-\(UUID()).json"))
+  let worker = DesktopWindowBackend(access: adapter, observationProvider: NoObserver(), permissionCheck: { true },
+    cameraJournal: store, onCurrentSpace: { _, _ in true }, processIdentity: { _ in birth })
+  return try worker.queue.sync {
+    let operation = DesktopOperation(timeout: 20)
+    worker.setFrontmost(pid: app.pid)
+    let selected = try worker.capture(application: app, operation: operation)
+    try worker.commit(id: selected.id, operation: operation)
+    _ = try worker.panCamera(by: 5, display: display, operation: operation)
+    let before = adapter.attributeRoundTrips
+    let commits = store.durableCommitCount
+    for _ in 0..<100 { _ = try worker.panCamera(by: 0.125, display: display, operation: operation) }
+    let count = adapter.attributeRoundTrips - before
+    expect(store.durableCommitCount == commits && adapter.focusWrites == 0,
+      "Attribute batching must preserve bounded durability and zero continuous focus changes")
+    _ = try worker.setCameraPaused(true, display: display, operation: operation)
+    expect(store.entries.isEmpty && adapter.frames[0] == CGRect(x: 72, y: 110, width: 620, height: 470),
+      "Sequential and batched reads must both restore the same exact original")
+    return count
+  }
+}
+let sequentialTrips = try attributeTripsForPan(batchEnabled: false)
+let batchedTrips = try attributeTripsForPan(batchEnabled: true)
+expect(sequentialTrips == 1600 && batchedTrips == 600, "One hundred same-workload visible pans must reduce attribute round trips from 1600 to 600; observed \(sequentialTrips) and \(batchedTrips)")
+print("Batched AX tests passed: \(sequentialTrips) -> \(batchedTrips) attribute round trips for 100 visible pans; partial errors, fresh exact membership/process checks, permission, Space, and durable restoration preserved.")
+
+func verifyOwnedParkedDialog(_ scenario: String) throws {
+  let adapter = CameraAX()
+  adapter.useParkedSubrole = true
+  let safety = CameraSafetyState()
+  let store = try DesktopCameraJournal(fileURL: folder.appendingPathComponent("parked-dialog-\(UUID()).json"))
+  let worker = DesktopWindowBackend(access: adapter, observationProvider: NoObserver(), permissionCheck: { true },
+    cameraJournal: store, onCurrentSpace: { _, _ in true }, processIdentity: { _ in safety.process() })
+  try worker.queue.sync {
+    let operation = DesktopOperation(timeout: 20)
+    worker.setFrontmost(pid: app.pid)
+    if scenario == "registration" {
+      adapter.subroles[0] = kAXDialogSubrole
+      failure { _ = try worker.capture(application: app, operation: operation) }
+      expect(adapter.writes.isEmpty && store.entries.isEmpty, "A new dialog cannot acquire camera ownership")
+      return
+    }
+    let selected = try worker.capture(application: app, operation: operation)
+    try worker.commit(id: selected.id, operation: operation)
+    if scenario == "user-minimized" || scenario == "position-only" {
+      if scenario == "position-only" {
+        adapter.positionWritable = true
+        _ = try worker.panCamera(by: 5, display: display, operation: operation)
+      }
+      adapter.minimized[0] = true
+      let writes = adapter.positionWrites.count
+      if scenario == "position-only" {
+        failure { _ = try worker.setCameraPaused(true, display: display, operation: operation) }
+        expect(!store.entries.isEmpty, "Position-only ownership cannot authorize restoring an owner-minimized dialog")
+      } else {
+        _ = try worker.moveCamera(by: 1, display: display, operation: operation)
+        expect(worker.state().windows[0].availability == .unavailable, "Unowned minimized dialogs cannot become candidates")
+      }
+      expect(adapter.writes.isEmpty && adapter.positionWrites.count == writes && adapter.minimized[0],
+        "Unowned minimization must never receive a recovery write")
+      return
+    }
+    _ = try worker.moveCamera(by: 1, display: display, operation: operation)
+    expect(adapter.minimized[0] && adapter.writes.count == 1 && store.entries.count == 1,
+      "A standard exact window must confirm its delivered park despite AppKit's minimized AXDialog subrole")
+    if scenario == "restore" {
+      adapter.afterRestore = { adapter.delayedStandardSubroleReads = 3 }
+      _ = try worker.setCameraPaused(true, display: display, operation: operation)
+      expect(adapter.delayedStandardSubroleReads == 0 && !adapter.minimized[0] && store.entries.isEmpty,
+        "Owned parked-dialog recovery must wait for visible AXStandardWindow before releasing durable ownership")
+      expect(adapter.writes.count == 2 && adapter.frames[0] == CGRect(x: 72, y: 110, width: 620, height: 470),
+        "Parked-dialog recovery must restore the exact original once without retargeting a sibling")
+      return
+    }
+    switch scenario {
+    case "nil-subrole": adapter.parkedSubrole = nil
+    case "other-subrole": adapter.parkedSubrole = kAXSystemDialogSubrole
+    case "visible-dialog": adapter.minimized[0] = false; adapter.subroles[0] = kAXDialogSubrole
+    case "missing-minimized": adapter.transientFailures[kAXMinimizedAttribute] = 1
+    case "wrong-role": adapter.roles[0] = kAXSheetRole
+    case "fullscreen": adapter.fullScreen[0] = true
+    case "sheets": adapter.sheets = [adapter.foreign]
+    case "membership": adapter.windows = [adapter.b, adapter.foreign]
+    case "pid": adapter.reportedPID = 41099
+    case "process": safety.replaceProcess()
+    case "journal-missing": try store.complete(id: selected.id)
+    case "journal-pid", "journal-process":
+      try store.complete(id: selected.id)
+      try store.prepare(DesktopCameraJournalEntry(id: selected.id,
+        pid: scenario == "journal-pid" ? 41099 : app.pid,
+        processIdentity: scenario == "journal-process" ? .init(seconds: 3, microseconds: 4) : birth,
+        title: selected.title, appName: app.appName, bundleIdentifier: nil, originalFrame: selected.originalFrame))
+    default: fatalError("Unknown parked-dialog scenario")
+    }
+    let writes = adapter.writes.count
+    failure { _ = try worker.setCameraPaused(true, display: display, operation: operation) }
+    expect(adapter.writes.count == writes && adapter.positionWrites.isEmpty,
+      "\(scenario) cannot use the owned parked-dialog exception to send any native write")
+    expect(worker.state().camera.paused && worker.state().camera.requiresRestoration,
+      "Failed parked-dialog identity must retain recovery ownership")
+  }
+}
+for scenario in ["restore", "registration", "user-minimized", "position-only", "nil-subrole", "other-subrole",
+  "visible-dialog", "missing-minimized", "wrong-role", "fullscreen", "sheets", "membership", "pid", "process",
+  "journal-missing", "journal-pid", "journal-process"] {
+  try verifyOwnedParkedDialog(scenario)
+}
+print("Owned parked-dialog tests passed: explicit minimized state, exact retained handle/process/journal ownership, strict visible StandardWindow convergence, and all invalid-context refusals.")
+
+final class ScalarCancellationAX: DesktopAXAccess {
+  let adapter = CameraAX()
+  var reads: [String] = []
+  var afterRead: ((String) -> Void)?
+  func application(pid: pid_t) -> AXUIElement { adapter.application(pid: pid) }
+  func timeout(_ element: AXUIElement) -> Bool { adapter.timeout(element) }
+  func pid(_ element: AXUIElement) -> pid_t? { adapter.pid(element) }
+  func read(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+    reads.append(name)
+    let value = adapter.read(element, name)
+    afterRead?(name)
+    return value
+  }
+  func perform(_ element: AXUIElement, _ action: String) -> AXError { adapter.perform(element, action) }
+  func mainSettable(_ element: AXUIElement) -> Bool { adapter.mainSettable(element) }
+  func makeMain(_ element: AXUIElement) -> AXError { adapter.makeMain(element) }
+}
+let cancellationAttributes = [kAXRoleAttribute, kAXSubroleAttribute, "AXFullScreen", kAXMinimizedAttribute, "AXSheets"]
+for cancelledAttribute in cancellationAttributes {
+  let adapter = ScalarCancellationAX()
+  let access: any DesktopAXAccess = adapter
+  let operation = DesktopOperation(timeout: 10)
+  adapter.afterRead = { if $0 == cancelledAttribute { operation.cancel() } }
+  failure { _ = try access.readMultiple(adapter.adapter.a, cancellationAttributes, operation) }
+  let last = cancellationAttributes.firstIndex(of: cancelledAttribute)!
+  expect(adapter.reads == Array(cancellationAttributes.prefix(last + 1)),
+    "Scalar cancellation after \(cancelledAttribute) must stop before the next native attribute IPC")
+}
+for expired in [false, true] {
+  let adapter = ScalarCancellationAX()
+  let access: any DesktopAXAccess = adapter
+  let operation = DesktopOperation(timeout: expired ? 0 : 10)
+  if !expired { operation.cancel() }
+  failure { _ = try access.readMultiple(adapter.adapter.a, cancellationAttributes, operation) }
+  expect(adapter.reads.isEmpty, "Cancelled or expired scalar operations must stop before the first native IPC")
+}
+let missingCancellationAX = ScalarCancellationAX()
+let missingCancellation = DesktopOperation(timeout: 10)
+missingCancellationAX.adapter.transientFailures[kAXRoleAttribute] = 1
+missingCancellationAX.afterRead = { _ in missingCancellation.cancel() }
+failure { _ = try missingCancellationAX.readMultiple(missingCancellationAX.adapter.a, cancellationAttributes, missingCancellation) }
+expect(missingCancellationAX.reads == [kAXRoleAttribute], "A failed scalar read must still observe cancellation before the next IPC")
+print("Scalar AX cancellation tests passed: cancelled/expired preflight, cancellation after each attribute, and missing-value cancellation stop the next native IPC.")

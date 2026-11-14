@@ -113,10 +113,22 @@ protocol DesktopAXAccess: AnyObject {
   func application(pid: pid_t) -> AXUIElement
   func timeout(_ element: AXUIElement) -> Bool
   func read(_ element: AXUIElement, _ name: String) -> CFTypeRef?
+  func readMultiple(_ element: AXUIElement, _ names: [String], _ operation: DesktopOperation) throws -> [CFTypeRef?]
   func pid(_ element: AXUIElement) -> pid_t?
   func perform(_ element: AXUIElement, _ action: String) -> AXError
   func mainSettable(_ element: AXUIElement) -> Bool
   func makeMain(_ element: AXUIElement) -> AXError
+}
+
+extension DesktopAXAccess {
+  func readMultiple(_ element: AXUIElement, _ names: [String], _ operation: DesktopOperation) throws -> [CFTypeRef?] {
+    try names.map { name in
+      try operation.check()
+      let value = read(element, name)
+      try operation.check()
+      return value
+    }
+  }
 }
 
 protocol DesktopCameraAXAccess: DesktopAXAccess {
@@ -143,6 +155,30 @@ final class SystemDesktopAXAccess: DesktopCameraAXAccess {
     }
     return value
   }
+  #if DESKTOP_AX_BATCH_EXPERIMENT
+  func readMultiple(_ element: AXUIElement, _ names: [String], _ operation: DesktopOperation) throws -> [CFTypeRef?] {
+    try operation.check()
+    var values: CFArray?
+    let status = AXUIElementCopyMultipleAttributeValues(element, names as CFArray, [], &values)
+    try operation.check()
+    guard status == .success else {
+      return Array(repeating: nil, count: names.count)
+    }
+    return Self.multipleValues(values, count: names.count)
+  }
+  static func multipleValues(_ values: CFArray?, count: Int) -> [CFTypeRef?] {
+    guard let values, CFArrayGetCount(values) == count else {
+      return Array(repeating: nil, count: count)
+    }
+    return (values as [AnyObject]).map { value in
+      if CFGetTypeID(value) == CFNullGetTypeID() { return nil }
+      if CFGetTypeID(value) == AXValueGetTypeID(), AXValueGetType(value as! AXValue) == .axError {
+        return nil
+      }
+      return value
+    }
+  }
+  #endif
   func pid(_ element: AXUIElement) -> pid_t? {
     var pid: pid_t = 0
     return AXUIElementGetPid(element, &pid) == .success ? pid : nil
@@ -245,6 +281,18 @@ final class DesktopWindowBackend: @unchecked Sendable {
     return result
   }
 
+  private func readMultiple(_ element: AXUIElement, _ names: [String], _ operation: DesktopOperation) throws
+    -> [CFTypeRef?]
+  {
+    try operation.check()
+    let result = try access.readMultiple(element, names, operation)
+    try operation.check()
+    guard result.count == names.count else {
+      throw DesktopWindowError.message("Accessibility returned an incomplete attribute batch.")
+    }
+    return result
+  }
+
   private func validateProcess(_ application: DesktopApplicationSnapshot, _ operation: DesktopOperation)
     throws
   {
@@ -255,8 +303,8 @@ final class DesktopWindowBackend: @unchecked Sendable {
   }
 
   private func frame(_ window: AXUIElement, _ operation: DesktopOperation) throws -> CGRect {
-    guard let position = try read(window, kAXPositionAttribute, operation),
-      let size = try read(window, kAXSizeAttribute, operation),
+    let values = try readMultiple(window, [kAXPositionAttribute, kAXSizeAttribute], operation)
+    guard let position = values[0], let size = values[1],
       CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID()
     else { throw DesktopWindowError.message("Cannot read the window's current bounds.") }
     var point = CGPoint.zero
@@ -721,7 +769,7 @@ final class DesktopWindowClient {
   }
 
   func focus(
-    id: UUID, cameraOwned: Bool = false,
+    id: UUID, cameraOwned: Bool = false, fromOverview: Bool = false,
     completion: @escaping @MainActor @Sendable (Result<DesktopWindow, DesktopWindowError>) -> Void
   ) {
     guard let operation = begin(cameraOwned: cameraOwned, completion: completion) else { return }
@@ -735,7 +783,7 @@ final class DesktopWindowClient {
     let display = displayProvider()
     backend.queue.async { [weak self] in
       do {
-        try backend.reveal(id: id, display: display, operation: operation)
+        try backend.reveal(id: id, display: display, operation: operation, fromOverview: fromOverview)
         _ = try backend.prepare(id: id, operation: operation)
       } catch {
         let failure = (error as? DesktopWindowError) ?? .message(error.localizedDescription)
@@ -1235,23 +1283,39 @@ extension DesktopWindowBackend {
     guard access.pid(record.window) == record.application.pid else {
       throw DesktopWindowError.message("The exact AX handle returned a different or unavailable PID.")
     }
-    guard try read(record.window, kAXRoleAttribute, operation) as? String == kAXWindowRole else {
+    let values = try readMultiple(record.window,
+      [kAXRoleAttribute, kAXSubroleAttribute, "AXFullScreen", kAXMinimizedAttribute, "AXSheets"], operation)
+    guard values[0] as? String == kAXWindowRole else {
       throw DesktopWindowError.message("AXRole is unavailable or is not AXWindow.")
     }
-    guard try read(record.window, kAXSubroleAttribute, operation) as? String == kAXStandardWindowSubrole else {
-      throw DesktopWindowError.message("AXSubrole is unavailable or is not AXStandardWindow.")
-    }
-    guard try read(record.window, "AXFullScreen", operation) as? Bool == false else {
+    guard values[2] as? Bool == false else {
       throw DesktopWindowError.message("AXFullScreen is unavailable or true.")
     }
-    guard let minimized = try read(record.window, kAXMinimizedAttribute, operation) as? Bool else {
+    guard let minimized = values[3] as? Bool else {
       throw DesktopWindowError.message("AXMinimized is temporarily unavailable.")
+    }
+    let subrole = values[1] as? String
+    let ownedParkedDialog: Bool
+    if minimized, subrole == kAXDialogSubrole,
+      let current = records[record.snapshot.id], current.snapshot.managerMinimized,
+      CFEqual(current.window, record.window), current.application.pid == record.application.pid,
+      current.application.processIdentity == record.application.processIdentity,
+      cameraJournal?.entries.contains(where: {
+        $0.id == record.snapshot.id && $0.pid == record.application.pid
+          && $0.processIdentity == record.application.processIdentity && !$0.originalMinimized
+      }) == true {
+      // AppKit can report AXDialog after our exact standard window is minimized.
+      // This permits only the owned parked handle; visible windows must become standard again.
+      ownedParkedDialog = true
+    } else { ownedParkedDialog = false }
+    guard subrole == kAXStandardWindowSubrole || ownedParkedDialog else {
+      throw DesktopWindowError.message("AXSubrole is unavailable or is not a standard or manager-owned parked window.")
     }
     guard let windows = try read(record.app, kAXWindowsAttribute, operation) as? [AXUIElement],
       windows.contains(where: { CFEqual($0, record.window) }) else {
       throw DesktopWindowError.message("AXWindows is unavailable or does not yet contain the exact registered handle.")
     }
-    if let sheets = try read(record.window, "AXSheets", operation) as? [AXUIElement], !sheets.isEmpty {
+    if let sheets = values[4] as? [AXUIElement], !sheets.isEmpty {
       throw DesktopWindowError.message("A window with an attached dialog cannot change pages.")
     }
     try validateProcess(record.application, operation)
@@ -1454,7 +1518,12 @@ extension DesktopWindowBackend {
   private func restoreManagedWindow(id: UUID, operation: DesktopOperation) throws {
     guard let record = records[id] else { return }
     if record.snapshot.managerMinimized {
+      let savedFocus: UnparkFocus?
+      if let display = cameraDisplay {
+        savedFocus = try focusBeforeUnpark(id: id, origin: nil, display: display, operation: operation)
+      } else { savedFocus = nil }
       try setManagerMinimized(id: id, minimized: false, operation: operation)
+      try preserveUnparkFocus(savedFocus, operation: operation)
     }
     guard record.positionManaged, let journal = cameraJournal,
       let entry = journal.entries.first(where: { $0.id == id }) else { return }
@@ -1499,7 +1568,7 @@ extension DesktopWindowBackend {
   }
 
   private func focusBeforeUnpark(
-    id: UUID, origin: CGFloat, display: DesktopCameraDisplay, operation: DesktopOperation
+    id: UUID, origin: CGFloat?, display: DesktopCameraDisplay, operation: DesktopOperation
   ) throws -> UnparkFocus? {
     let generation = userInputGeneration()
     guard let arriving = records[id], arriving.snapshot.managerMinimized,
@@ -1511,9 +1580,9 @@ extension DesktopWindowBackend {
         previous.application.pid == arriving.application.pid,
         previous.application.processIdentity == arriving.application.processIdentity,
         previous.cameraScopeEligible, !previous.snapshot.managerMinimized,
-        let physical = previous.lastPhysicalFrame, physical.intersects(display.frame),
-        previous.snapshot.worldFrame.offsetBy(dx: -origin, dy: 0).intersects(display.frame)
+        let physical = previous.lastPhysicalFrame, physical.intersects(display.frame)
       else { return false }
+      if let origin, !previous.snapshot.worldFrame.offsetBy(dx: -origin, dy: 0).intersects(display.frame) { return false }
       return CFEqual(previous.window, focused)
     }) else { return nil }
     guard userInputGeneration() == generation else { return nil }
@@ -1714,8 +1783,36 @@ extension DesktopWindowBackend {
     return try applyCamera(page: camera.page, display: display, operation: operation)
   }
 
-  func reveal(id: UUID, display: DesktopCameraDisplay?, operation: DesktopOperation) throws {
+  func reveal(id: UUID, display: DesktopCameraDisplay?, operation: DesktopOperation, fromOverview: Bool = false) throws {
     guard let record = records[id] else { return }
+    if fromOverview || (continuousCamera && !camera.paused) {
+      guard !camera.paused else { throw DesktopWindowError.message("Resume the workspace before selecting a window in overview.") }
+      let display = try ensureCamera(display: display, operation: operation)
+      guard record.cameraScopeEligible else { throw DesktopWindowError.message("The selected window left this workspace.") }
+      let minimized = try validateCameraIdentity(record, operation)
+      guard !minimized || record.snapshot.managerMinimized else {
+        throw DesktopWindowError.message("The selected window was minimized outside InfiniteDesk.")
+      }
+      if !minimized {
+        let physical = try frame(record.window, operation)
+        guard onCurrentSpace(record.application.pid, physical) else {
+          throw DesktopWindowError.message("The selected window is outside the current Space or cannot be identified on it.")
+        }
+        // A visible original keeps its position when selected, including its visible sliver at the edge.
+        return
+      }
+      let world = record.snapshot.worldFrame
+      let width = display.visibleFrame.width
+      let leading = world.minX - display.visibleFrame.minX
+      let trailing = world.maxX - display.visibleFrame.maxX
+      let target = world.width <= width ? min(leading, max(trailing, camera.origin.x))
+        : max(leading, min(trailing, camera.origin.x))
+      _ = try panCamera(by: target - camera.origin.x, display: display, operation: operation)
+      guard records[id]?.snapshot.managerMinimized == false else {
+        throw DesktopWindowError.message("The selected window could not be restored at its workspace position.")
+      }
+      return
+    }
     if record.snapshot.managerMinimized || (!camera.paused && record.snapshot.cameraPage != camera.page) {
       let display = try ensureCamera(display: display, operation: operation)
       _ = try applyCamera(page: record.snapshot.cameraPage, display: display, operation: operation)

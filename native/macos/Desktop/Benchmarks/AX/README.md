@@ -26,8 +26,12 @@ select your own normal signing identity; default signing is ad hoc.
 ## Scalar default and opt-in bulk experiment
 
 The default build uses scalar reads, matching the shipping `SystemDesktopAXAccess`
-strategy. `GuardedAX.readMultiple` delegates to its counted/guarded `read` for each
-attribute. To experiment with native `AXUIElementCopyMultipleAttributeValues`, set
+strategy. `GuardedAX.readMultiple` uses its counted/guarded scalar reader for each
+attribute, checking the operation before and after each native read and PID guard.
+The operation-aware three-argument throwing signature matches the production
+protocol. Bulk mode also checks around its native call; diagnostic reads check
+cancellation individually. A headless cancelled-operation check verifies that
+neither mode reaches native access after cancellation. To experiment with native `AXUIElementCopyMultipleAttributeValues`, set
 `INFINITEDESK_AX_BATCH_EXPERIMENT=1`; this is the only route that passes Swift's
 `-D DESKTOP_AX_BATCH_EXPERIMENT`. Values other than `0` and `1` are rejected.
 Keep separate cache tags for the two modes:

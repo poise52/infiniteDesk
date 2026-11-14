@@ -358,6 +358,15 @@ func launchContext() -> [String: Any] {
     try output(testManager(command: command, pid: pid, session: args[2], statePath: args[3], journalPath: args[4]))
     return
   }
+  if command == "manager-overview-key" {
+    guard args.count == 10, let pid = pid_t(args[1]), let fixturePID = pid_t(args[6]),
+      let fixtureID = CGWindowID(args[7]), let panelID = CGWindowID(args[8]) else {
+      throw Failure.message("Invalid guarded overview key request")
+    }
+    try output(testOverviewKey(pid: pid, session: args[2], statePath: args[3], journalPath: args[4],
+      key: args[5], fixturePID: fixturePID, fixtureID: fixtureID, panelID: panelID, selectedID: args[9]))
+    return
+  }
   if command == "finder-snapshot" {
     try output(["windows": try finderSnapshot()])
     return
@@ -414,7 +423,7 @@ func launchContext() -> [String: Any] {
   switch command {
   case "shortcut":
     let codes: [String: CGKeyCode] = ["register": 13, "left": 123, "right": 124,
-      "newPage": 45, "pageLeft": 33, "pageRight": 30, "togglePause": 35]
+      "newPage": 45, "pageLeft": 33, "pageRight": 30, "togglePause": 35, "overview": 31]
     guard let code = codes[args[3]] else { throw Failure.message("Unknown shortcut") }
     try postKey(code, flags: [.maskControl, .maskAlternate, .maskCommand])
   case "type":

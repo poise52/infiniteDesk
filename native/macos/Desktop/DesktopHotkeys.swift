@@ -12,6 +12,7 @@ enum DesktopShortcut: UInt32, CaseIterable {
   case previousPage = 5
   case nextPage = 6
   case pause = 7
+  case overview = 8
 
   var keyCode: UInt32 {
     switch self {
@@ -22,6 +23,7 @@ enum DesktopShortcut: UInt32, CaseIterable {
     case .previousPage: UInt32(kVK_ANSI_LeftBracket)
     case .nextPage: UInt32(kVK_ANSI_RightBracket)
     case .pause: UInt32(kVK_ANSI_P)
+    case .overview: UInt32(kVK_ANSI_O)
     }
   }
 
@@ -34,6 +36,7 @@ enum DesktopShortcut: UInt32, CaseIterable {
     case .previousPage: "⌃⌥⌘["
     case .nextPage: "⌃⌥⌘]"
     case .pause: "⌃⌥⌘P"
+    case .overview: "⌃⌥⌘O"
     }
   }
 }

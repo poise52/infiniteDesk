@@ -19,7 +19,7 @@ const cameraMode = process.env.INFINITEDESK_TEST_CAMERA_MODE;
 const journalPath = process.env.INFINITEDESK_TEST_CAMERA_JOURNAL_PATH;
 const session = process.env.INFINITEDESK_TEST_SESSION;
 if (cameraMode) {
-  assert(['quit', 'crash', 'pan'].includes(cameraMode) && statePath && isAbsolute(journalPath ?? '')
+  assert(['quit', 'crash', 'pan', 'overview'].includes(cameraMode) && statePath && isAbsolute(journalPath ?? '')
     && /^[a-f0-9-]{32,36}$/i.test(session ?? ''), 'Camera acceptance needs an isolated test manager, journal, and session UUID');
 }
 const geometryCases = ['Original model geometry', 'External titlebar click focuses B', 'Fast titlebar drag B',
@@ -624,12 +624,25 @@ try {
   assert(!sameFrame(a.frame, b.frame), 'The test requires distinct noncentral native frames');
   const baseline = [a, b];
   report.originals = { A: a, B: b };
+  if (cameraMode === 'overview') {
+    for (const target of [targets.A, targets.B]) await evaluate(target, 'document.title = "InfiniteDesk Identical Title"');
+    await eventually('Both titles must match before registering windows for overview', async () => snapshot(),
+      state => state.windows.length === 2 && state.windows.every(window => window.title.startsWith('InfiniteDesk Identical Title')));
+  }
   let setupInputPassed = true;
   for (const [name, window] of [['A', a], ['B', b]]) {
     if (cameraMode) await cdp.send('Target.activateTarget', { targetId: targets[name].targetId });
     native('focus', pid, window.id);
     await evaluate(targets[name], `(() => { const field = document.querySelector('#target'); field.focus();
       field.setSelectionRange(field.value.length, field.value.length); })()`);
+    if (cameraMode === 'overview') {
+      await eventually('Fixture field must hold a native caret before setup typing', async () => {
+        const actual = snapshot();
+        const field = await values(name);
+        return actual.frontmostPID === pid && actual.focusedID === window.id
+          && field.focused && field.active === 'target' && field.selection?.end === field.target.length;
+      }, Boolean);
+    }
     const inputPassed = await typeToken(`Setup ${name}`, name, window.id, `-original-${name}`);
     setupInputPassed = inputPassed && setupInputPassed;
     if (statePath && name === 'A') {
@@ -646,7 +659,8 @@ try {
   unchanged(requireNative(report.setupEvidence), baseline);
   await saveReport();
   if (cameraMode) {
-    const verifyWorkspace = cameraMode === 'pan' ? (await import('./pan.mjs')).verifyPan : (await import('./camera.mjs')).verifyCamera;
+    const verifyWorkspace = cameraMode === 'overview' ? (await import('./overview.mjs')).verifyOverview
+      : cameraMode === 'pan' ? (await import('./pan.mjs')).verifyPan : (await import('./camera.mjs')).verifyCamera;
     const readBounds = async name => (await cdp.send('Browser.getWindowBounds', { windowId: targets[name].windowId })).bounds;
     const restoreFixture = async name => {
       assert(['A', 'B'].includes(name));
@@ -669,6 +683,7 @@ try {
 } catch (error) {
   report.status = 'FAIL';
   if (cameraMode) report.camera.status = 'FAIL';
+  if (report.camera.overview) report.camera.overview.status = 'FAIL';
   if (statePath && !cameraMode && report.geometry.status !== 'PASS') report.geometry.status = 'FAIL';
   report.error = error.stack ?? String(error);
   report.nativeFocusStatus = 'INCOMPLETE';

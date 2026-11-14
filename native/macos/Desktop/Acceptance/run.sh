@@ -39,6 +39,7 @@ if [ "$1" = --check ]; then
   node --check "$here/pan.mjs"
   node --check "$here/camera.mjs"
   node --check "$here/camera-lifecycle.mjs"
+  node --check "$here/overview.mjs"
   node --check "$here/geometry.mjs"
   node --test "$here/geometry.test.mjs"
   printf 'Acceptance bundle verified: %s\nNo GUI or permissions check was performed.\n' "$bundle"

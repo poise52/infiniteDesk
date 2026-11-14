@@ -3,6 +3,12 @@ import OSLog
 
 // The lock owns the pending snapshot and drain state; only the serial queue performs I/O.
 final class DesktopTestState: @unchecked Sendable {
+  struct Overview: Encodable, Sendable {
+    let visible: Bool
+    let isKey: Bool
+    let selectedID: UUID?
+    let windowNumber: Int?
+  }
   private struct Frame: Encodable, Sendable {
     let x: Double
     let y: Double
@@ -64,6 +70,7 @@ final class DesktopTestState: @unchecked Sendable {
   }
 
   private struct Output: Encodable {
+    let overview: Overview?
     let managerPID: Int32
     let testSession: String?
     let windows: [Window]
@@ -73,6 +80,7 @@ final class DesktopTestState: @unchecked Sendable {
   }
 
   private struct Snapshot: Sendable {
+    let overview: Overview?
     let windows: [DesktopWindow]
     let focusedID: UUID?
     let camera: Camera
@@ -106,9 +114,9 @@ final class DesktopTestState: @unchecked Sendable {
 
   func publish(
     windows: [DesktopWindow], focusedID: UUID?, camera: DesktopCameraSnapshot, busy: Bool,
-    pan: DesktopPanMetrics? = nil
+    pan: DesktopPanMetrics? = nil, overview: Overview? = nil
   ) {
-    let snapshot = Snapshot(windows: windows, focusedID: focusedID, camera: Camera(camera, busy: busy), pan: pan)
+    let snapshot = Snapshot(overview: overview, windows: windows, focusedID: focusedID, camera: Camera(camera, busy: busy), pan: pan)
     lock.lock()
     guard !stopped else { lock.unlock(); return }
     pending = snapshot
@@ -141,7 +149,7 @@ final class DesktopTestState: @unchecked Sendable {
         try FileManager.default.createDirectory(
           at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let output = Output(
-          managerPID: ProcessInfo.processInfo.processIdentifier, testSession: testSession,
+          overview: snapshot.overview, managerPID: ProcessInfo.processInfo.processIdentifier, testSession: testSession,
           windows: snapshot.windows.map(Window.init), focusedID: snapshot.focusedID, camera: snapshot.camera,
           pan: snapshot.pan)
         try encoder.encode(output).write(to: fileURL, options: .atomic)

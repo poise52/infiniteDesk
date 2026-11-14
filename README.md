@@ -3,7 +3,7 @@
 > [!WARNING]
 > **Do not download or install InfiniteDesk.** The project is unfinished. The build instructions below are for development and testing only.
 
-InfiniteDesk is a macOS menu bar app for registering and focusing real application windows. Registration reads the focused window where it is. You can then switch between registered windows, including two windows belonging to the same app. The development build also has horizontal workspace panning and page shortcuts at 1:1 scale, Pause/Restore and an interrupted-session recovery journal. Registrations last for the current session. The zoomed-out overview is planned.
+InfiniteDesk is a macOS menu bar app for registering and focusing real application windows. Registration reads the focused window where it is. You can then switch between registered windows, including two windows belonging to the same app. The development build also has horizontal workspace panning and page shortcuts at 1:1 scale, Pause/Restore and an interrupted-session recovery journal. Registrations last for the current session. The workspace overview shows registered windows at their world positions and lets you return to a selected original.
 
 ## Build and try the desktop manager
 
@@ -21,6 +21,8 @@ Open the InfiniteDesk icon in the menu bar and grant Accessibility access when r
 3. Drag a registered window by its title bar, or resize it by an edge. Release the mouse and open the InfiniteDesk menu. The window's row shows its workspace position and size in macOS points. Page changes preserve these workspace coordinates.
 4. A checkmark identifies the focused registered window. Choose a row to focus that window. A closed window keeps its last known bounds until you forget it. The menu reports when an application cannot send the notifications used for tracking.
 
+Press **⌃⌥⌘O** to see the registered windows on a map. The dashed outline shows the current viewport. Scroll or pinch to zoom around the pointer, press **F** to fit the workspace, or use **Tab** and the arrow keys to select a window. **Enter** or a click opens the selected original at 1:1. If it is offscreen, the camera moves just far enough to show it. **Escape** closes the map and leaves the desktop where it was. The map uses window bounds, titles and app icons and requires no screen capture.
+
 For the experimental page controls, use one display and one ordinary macOS Space. Fullscreen windows and windows on other Spaces are outside this stage's scope. Managed windows on other pages are minimized through macOS and restored when you return. The menu reports the current page, camera origin, paused state and operation failures.
 
 | Shortcut | Action |
@@ -28,6 +30,7 @@ For the experimental page controls, use one display and one ordinary macOS Space
 | **⌃⌥⌘W** | Register the focused window without moving it. |
 | **⌃⌥⌘← / →** | Focus the previous/next registered window; reveal its page when necessary. |
 | **⌃⌥⌘N** | Move the focused registered window one page right and follow it. |
+| **⌃⌥⌘O** | Open or dismiss the workspace overview. |
 | **⌃⌥⌘[ / ]** | Move the camera to the previous/next workspace page. |
 | **⌥⌘ + left drag** | Pan horizontally; the workspace follows the pointer. Release, reposition the pointer and drag again to continue. |
 | **⌃⌥⌘ + scroll** | Pan with a mouse wheel or trackpad; horizontal scrolling takes precedence, vertical scrolling is a fallback. |
@@ -43,7 +46,11 @@ Pan requires Accessibility, a running workspace and at least one registered wind
 
 On macOS 27.0.1, the earlier local GUI tests verified page switching and immediate typing in two Chrome 156 windows with identical titles on one display. The off-page original disappeared from the on-screen window list, and the visible Finder window kept its bounds. Both Pause and normal Quit released the parked original. After a forced termination, the restarted manager kept the journal available for manual recovery. A separate live pan test moved both original windows, reversed direction, moved A to x = −32 pt, then parked and restored it. B kept keyboard focus when A returned, and the next typed token reached B’s original text field. Ordinary wheel input scrolled the browser. Pause restored A and kept B’s most recent manual placement.
 
-On this Mac, 230 continuous camera batches over two Chrome windows took 19.3 ms at p50, 38.0 ms at p95 and 40.0 ms at p99 on the AX worker. Independent WindowServer polling observed changing positions at p99 intervals of 41–42 ms across two drags. Display presentation and native-window counts above two still need measurement.
+On this Mac, 230 continuous camera batches over two Chrome windows took 19.3 ms at p50, 38.0 ms at p95 and 40.0 ms at p99 on the AX worker. Independent WindowServer polling observed changing positions at p99 intervals of 41–42 ms across two drags. Neither measurement times display presentation.
+
+The [native AX benchmark](native/macos/Desktop/Benchmarks/AX/README.md) separately moved 2, 5 and 10 real AppKit windows. The baseline's individual attribute reads took 37, 77 and 137 ms at p99 per movement batch; experimental grouped reads took 36, 68 and 149 ms. Each figure pools two runs of 40 batches; at this sample size p99 is the slowest observation. The normal build keeps individual reads. In a separate run with the restoration fix and grouped reads, minimizing all 10 windows at the workspace edge took 6.16 s and restoring them took 6.34 s (one measured batch each). Crossing the edge with many windows is still visibly slow.
+
+In the live overview test, Escape preserved both original frames, camera position and Chrome focus. Selecting parked originals with Tab or Shift-Tab and pressing Enter delivered the next typed token to the chosen window, even though both titles matched. Pause then restored both originals and retained B’s focus.
 
 Run the desktop checks without opening windows or granting Accessibility access:
 

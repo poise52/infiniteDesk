@@ -97,6 +97,7 @@ or previously synthesized modifier state.
 | Register foreground window | Control + Option + Command + W |
 | Previous registered window | Control + Option + Command + Left |
 | Next registered window | Control + Option + Command + Right |
+| Workspace overview | Control + Option + Command + O |
 
 The run records real AX frames and Core Graphics window IDs, types independent
 tokens into original A and B, and registers both. It cycles A → B → A through
@@ -306,3 +307,43 @@ between changed positions observed by a polling client. Display presentation
 times require a separate measurement. For a discrete comparison on the same
 build, start a fresh manager in `quit` mode and set
 `INFINITEDESK_TEST_PAGE_ROUNDTRIPS=4` to add eight verified page switches.
+
+## Workspace overview
+
+Use the same isolated fresh-manager procedure with
+`INFINITEDESK_TEST_CAMERA_MODE=overview`. Build the product and run acceptance
+`--check` before reviewing the dedicated driver's existing grant. This mode
+requires the opt-in model export to include
+`overview: {visible,isKey,windowNumber?,selectedID?}`. It opens no permission prompts.
+
+```sh
+INFINITEDESK_TEST_CAMERA_MODE=overview native/macos/Desktop/Acceptance/run.sh --run
+```
+
+The harness registers original A then B, gives both the identical title, and
+retains their model UUIDs and independent native CG identities. From focused B
+it opens overview and sends Escape. Both native frames, native/model focus,
+camera state, world geometry, and input values must stay unchanged. It then
+moves B one page right, verifies that A is parked, opens overview, selects A
+with Tab, and presses Enter. It verifies the exact original A at native 1:1 and
+types a token into its already focused field. A second overview uses Shift-Tab
+to select B and repeats the native focus/input proof. Selection may move the
+camera only far enough to reveal the chosen window; the test compares native
+bounds with world coordinates minus the actual camera origin. It does not
+assume that selection snaps to a page origin.
+
+Escape, Tab, Shift-Tab, and Enter are posted only to the manager PID. Before
+each key the signed driver verifies the exact current product bundle,
+process birth identity, session UUID, opt-in paths, and snapshot ownership.
+The snapshot must identify the visible key panel and expected selected UUID.
+An independent on-screen CG record must match that panel's exact window number
+and manager owner PID. Chrome must remain foreground with the expected original
+AX window focused. A failed guard sends no key. The driver never activates the
+manager or posts these plain keys globally.
+
+`camera.overview` retains checkpoints and guarded key receipts. Each return
+checks original sizes, unchanged world frames, CG visibility, AX minimization,
+Chrome's independent native window state, and existing Finder bounds. Finally
+Pause must restore both original frames and clear the isolated recovery journal.
+`--check` compiles and signs the driver and parses the overview script; only
+`--run` establishes a live overview result.

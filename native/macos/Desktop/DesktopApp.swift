@@ -11,6 +11,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let menu = NSMenu()
   private var hotkeys: DesktopHotkeys?
   private var panInput: DesktopPanInput?
+  private let overview = DesktopOverviewController()
   private var menuApplication: DesktopApplicationSnapshot?
   private var selectedID: UUID?
   private var cycleCursorID: UUID?
@@ -37,6 +38,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     item.button?.toolTip = "InfiniteDesk — desktop window manager"
     item.menu = menu
     statusItem = item
+    if testState != nil { overview.onChange = { [weak self] in self?.exportTestState() } }
     menu.delegate = self
     menu.autoenablesItems = false
     client.onChange = { [weak self] in self?.modelDidChange() }
@@ -48,7 +50,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     shortcutWarning = hotkeys.start()
     let panInput = DesktopPanInput(enabled: { [weak self] in
       guard let self else { return false }
-      return self.trusted && !self.terminating && !self.client.camera.paused
+      return self.trusted && !self.terminating && !self.overview.isVisible && !self.client.camera.paused
         && self.client.camera.recoveryCount == 0 && !self.client.windows.isEmpty
     }, authorize: { [weak self] in self?.requirePermission() ?? false },
     action: { [weak self] packet in self?.pan(packet) }, statusChanged: { [weak self] warning in
@@ -76,6 +78,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     guard !terminating else { return .terminateLater }
     terminating = true
+    overview.cancel()
     status = "Restoring managed windows before quitting…"
     updateStatus()
     client.restoreForQuit { [weak self] result in
@@ -109,6 +112,13 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   private func modelDidChange() {
+    if overview.isVisible {
+      if client.camera.paused || client.camera.recoveryCount > 0 || !trusted {
+        overview.cancel()
+      } else {
+        overview.update(windows: client.windows, camera: client.camera)
+      }
+    }
     if observedFocusedID != client.focusedID {
       observedFocusedID = client.focusedID
       if let focusedID = client.focusedID, pendingFocusID == nil {
@@ -116,9 +126,15 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cycleCursorID = nil
       }
     }
-    testState?.publish(windows: client.windows, focusedID: client.focusedID,
-      camera: client.camera, busy: client.isCameraBusy, pan: client.panMetrics)
+    exportTestState()
     updateStatus()
+  }
+
+  private func exportTestState() {
+    testState?.publish(windows: client.windows, focusedID: client.focusedID,
+      camera: client.camera, busy: client.isCameraBusy, pan: client.panMetrics,
+      overview: .init(visible: overview.isVisible, isKey: overview.isKey,
+        selectedID: overview.selectedID, windowNumber: overview.windowNumber))
   }
 
   private func externalApplication() -> DesktopApplicationSnapshot? {
@@ -134,6 +150,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     trusted = current
     client.setAccessibilityTrusted(current)
     if !current {
+      overview.cancel()
       panInput?.stop()
       panWarning = "Continuous pan stopped: Accessibility permission is required."
       client.cancel()
@@ -149,6 +166,10 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   private func handle(_ shortcut: DesktopShortcut) {
     logCommand(shortcut.label, source: "global")
+    if overview.isVisible && shortcut != .overview {
+      if shortcut == .pause { overview.cancel(); togglePause() }
+      return
+    }
     switch shortcut {
     case .register: register(application: externalApplication())
     case .previous: cycle(direction: -1)
@@ -157,7 +178,28 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     case .previousPage: changePage(by: -1)
     case .nextPage: changePage(by: 1)
     case .pause: togglePause()
+    case .overview: toggleOverview()
     }
+  }
+
+  @objc private func toggleOverview() {
+    if overview.isVisible { overview.cancel(); return }
+    guard requirePermission(), !client.isCameraBusy, !client.camera.paused, client.camera.recoveryCount == 0 else {
+      status = "Overview is available while the workspace is active."
+      updateStatus()
+      return
+    }
+    let windows = client.windows
+    guard windows.contains(where: { $0.availability == .available || $0.managerMinimized }) else {
+      status = "Register a window to open the workspace overview."
+      updateStatus()
+      return
+    }
+    let shown = overview.show(windows: windows, camera: client.camera, focusedID: client.focusedID,
+      backToFront: desktopOverviewWindowOrder(windows: windows, origin: client.camera.origin),
+      onSelect: { [weak self] id in self?.select(id: id, fromOverview: true) },
+      onCancel: { [weak self] in self?.updateStatus() })
+    if !shown { status = "Overview requires one active display."; updateStatus() }
   }
 
   private func register(application: DesktopApplicationSnapshot?) {
@@ -211,14 +253,14 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     select(id: windows[index].id)
   }
 
-  private func select(id: UUID) {
+  private func select(id: UUID, fromOverview: Bool = false) {
     guard requirePermission(), let window = client.windows.first(where: { $0.id == id }) else { return }
     cycleCursorID = id
     pendingFocusID = id
     logger.info("focus begin pid=\(window.pid) number=\(self.registrationNumbers[id] ?? 0) windows=\(self.client.windows.count)")
     status = "Focusing: \(label(window))…"
     updateStatus()
-    client.focus(id: id) { [weak self] result in
+    client.focus(id: id, fromOverview: fromOverview) { [weak self] result in
       guard let self else { return }
       self.pendingFocusID = nil
       switch result {
@@ -381,6 +423,8 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     append("Next workspace page", action: #selector(nextPageFromMenu),
       enabled: workspaceAvailable && !camera.paused, shortcut: .nextPage)
     append("Pan: hold ⌥⌘ and drag left/right", enabled: false)
+    append("Workspace overview", action: #selector(toggleOverview),
+      enabled: workspaceAvailable && !camera.paused && !client.windows.isEmpty, shortcut: .overview)
     append("Mouse / trackpad: hold ⌃⌥⌘ and scroll", enabled: false)
     let pauseTitle = camera.paused ? (requiresRestoration ? "Restore managed windows" : "Resume workspace")
       : "Pause and restore windows"

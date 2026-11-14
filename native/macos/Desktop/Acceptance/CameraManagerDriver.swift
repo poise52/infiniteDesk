@@ -1,4 +1,5 @@
 import AppKit
+@preconcurrency import ApplicationServices
 import Darwin
 import Foundation
 import Security
@@ -182,4 +183,58 @@ private extension String {
   func removingPrefix(_ prefix: String) -> String {
     hasPrefix(prefix) ? String(dropFirst(prefix.count)) : self
   }
+}
+
+@MainActor
+func testOverviewKey(pid: pid_t, session: String, statePath: String, journalPath: String,
+  key: String, fixturePID: pid_t, fixtureID: CGWindowID, panelID: CGWindowID, selectedID: String
+) throws -> [String: Any] {
+  let keys: [String: CGKeyCode] = ["escape": 53, "tab": 48, "backtab": 48, "enter": 36]
+  guard let code = keys[key], UUID(uuidString: selectedID) != nil,
+    let fixture = NSRunningApplication(processIdentifier: fixturePID),
+    fixture.bundleIdentifier == "com.google.Chrome", fixturePID != pid else {
+    throw Failure.message("Overview input allows only explicit panel keys and the disposable Chrome fixture")
+  }
+  let identity = try testManager(command: "manager-identity", pid: pid, session: session,
+    statePath: statePath, journalPath: journalPath)
+  let process = try TestManagerProcess.read(pid)
+  guard let birth = identity["processIdentity"] as? [String: UInt64],
+    birth["seconds"] == process.seconds, birth["microseconds"] == process.microseconds else {
+    throw Failure.message("Overview manager process changed after identity verification")
+  }
+  func panel() throws -> [String: Any] {
+    let state = try testManagerSnapshot(statePath)
+    guard (state["managerPID"] as? NSNumber)?.int32Value == pid,
+      state["testSession"] as? String == session,
+      let overview = state["overview"] as? [String: Any],
+      overview["visible"] as? Bool == true, overview["isKey"] as? Bool == true,
+      (overview["windowNumber"] as? NSNumber)?.uint32Value == panelID,
+      overview["selectedID"] as? String == selectedID,
+      let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]],
+      let actual = list.first(where: {
+        ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == panelID
+          && ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid
+      }), let bounds = actual[kCGWindowBounds as String] as? NSDictionary,
+      let frame = CGRect(dictionaryRepresentation: bounds), frame.width > 100, frame.height > 100,
+      (actual[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 0 > 0,
+      NSWorkspace.shared.frontmostApplication?.processIdentifier == fixturePID else {
+      throw Failure.message("Overview input refused: the exact session panel is not visible, key, and owned by the verified manager")
+    }
+    let app = AXUIElementCreateApplication(fixturePID)
+    _ = AXUIElementSetMessagingTimeout(app, 0.3)
+    guard focusedID(app, windows: try windows(fixturePID, app: app)) == fixtureID else {
+      throw Failure.message("Overview input refused: the disposable original lost native focus")
+    }
+    return ["id": panelID, "pid": pid, "frame": frameJSON(frame),
+      "layer": actual[kCGWindowLayer as String] ?? NSNull(), "selectedID": selectedID]
+  }
+  let observed = try panel()
+  guard try TestManagerProcess.read(pid) == process else {
+    throw Failure.message("Overview manager process changed before input")
+  }
+  _ = try panel()
+  try postKey(code, flags: key == "backtab" ? [.maskShift] : [], pid: pid)
+  return ["status": "sent", "command": "manager-overview-key", "key": key,
+    "manager": identity, "panel": observed, "fixturePID": fixturePID, "fixtureID": fixtureID,
+    "delivery": "PID-targeted; no activation or global plain key"]
 }

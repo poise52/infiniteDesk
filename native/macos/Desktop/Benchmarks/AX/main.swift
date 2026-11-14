@@ -98,6 +98,7 @@ final class GuardedAX: DesktopCameraAXAccess {
     // Extra diagnostic IPC occurs only after identity validation has already failed.
     func diagnosticRead(_ source: AXUIElement, _ name: String) throws -> CFTypeRef? {
       try operation?.check()
+      calls.reads += 1; calls.requestedAttributes += 1
       let value = base.read(source, name)
       try operation?.check()
       return value
@@ -109,7 +110,6 @@ final class GuardedAX: DesktopCameraAXAccess {
     try operation?.check()
     let actualPID = base.pid(element)
     try operation?.check()
-    calls.reads += 4; calls.requestedAttributes += 4
     if diagnostics.count == 32 { diagnostics.removeFirst() }
     diagnostics.append(AXDiagnostic(method: method, lastMutation: lastMutation,
       returnedSubrole: raw, returnedTypeID: type, status: rawStatus,
