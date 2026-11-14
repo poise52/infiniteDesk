@@ -64,7 +64,7 @@ private final class FrameProcessor: NSObject, SCStreamOutput, @unchecked Sendabl
 }
 
 @MainActor
-final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDelegate {
+final class WindowCapture: NSObject, SCStreamDelegate {
   let layer = CALayer()
   private var processor: FrameProcessor!
   var onUpdate: ((String, Bool) -> Void)?
@@ -77,11 +77,13 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
   #endif
   private var stream: SCStream?
   private var selectedApp: NSRunningApplication?
+  private var selectedWindow: WindowFocusIdentity?
+  private var focusGate: WindowFocusGate?
+  private var focusTransition = false
   private var pendingStream: SCStream?
   private var pendingFrame: CGImage?
   private var generation = 0
   private var picking = false
-  private var registered = false
   private var destroyed = false
   private var startTask: Task<Void, Never>?
 
@@ -96,64 +98,48 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
 
   func selectWindow() {
     guard !destroyed, !picking else { return }
-    picking = true
-    let picker = SCContentSharingPicker.shared
-    var configuration = SCContentSharingPickerConfiguration()
-    configuration.allowedPickerModes = .singleWindow
-    if let bundle = Bundle.main.bundleIdentifier { configuration.excludedBundleIDs = [bundle] }
-    picker.defaultConfiguration = configuration
-    if !registered {
-      picker.add(self)
-      picker.isActive = true
-      registered = true
+    cancelPendingFocus()
+    guard WindowPickerCoordinator.shared.present(self) else {
+      onUpdate?("Finish the other window selection first", false)
+      return
     }
-    picker.present(using: .window)
+    picking = true
   }
 
-  private func endPicker() {
-    picking = false
+  func ownsPickerStream(_ id: ObjectIdentifier) -> Bool {
+    stream.map(ObjectIdentifier.init) == id || pendingStream.map(ObjectIdentifier.init) == id
   }
+
+  private func endPicker() { picking = false }
 
   private func releasePickerIfIdle() {
-    guard registered, !picking, stream == nil, pendingStream == nil else { return }
-    SCContentSharingPicker.shared.remove(self)
-    SCContentSharingPicker.shared.isActive = false
-    registered = false
+    guard !picking, stream == nil, pendingStream == nil else { return }
+    WindowPickerCoordinator.shared.release(self)
   }
 
-  nonisolated func contentSharingPicker(
-    _ picker: SCContentSharingPicker, didCancelFor stream: SCStream?
-  ) {
-    Task { @MainActor [weak self] in
-      self?.endPicker()
-      self?.releasePickerIfIdle()
-    }
+  func pickerCancelled() {
+    endPicker()
+    releasePickerIfIdle()
   }
 
-  nonisolated func contentSharingPickerStartDidFailWithError(_ error: any Error) {
-    let message = error.localizedDescription
-    Task { @MainActor [weak self] in
-      self?.endPicker()
-      self?.releasePickerIfIdle()
-      self?.onUpdate?("Picker failed: \(message)", false)
-    }
+  func pickerFailed(_ message: String) {
+    endPicker()
+    releasePickerIfIdle()
+    onUpdate?("Picker failed: \(message)", false)
   }
 
-  nonisolated func contentSharingPicker(
-    _ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?
-  ) {
-    let streamID = stream.map(ObjectIdentifier.init)
-    Task { @MainActor [weak self] in
-      guard let self else { return }
-      if let current = self.stream, streamID == ObjectIdentifier(current), !self.picking {
-        self.updateExisting(current, filter: filter)
-      } else {
-        self.begin(filter)
-      }
+  func pickerUpdated(_ filter: SCContentFilter, streamID: ObjectIdentifier?) {
+    if let stream, streamID == ObjectIdentifier(stream), !picking {
+      updateExisting(stream, filter: filter)
+    } else if streamID == nil {
+      begin(filter)
     }
   }
 
   private func updateExisting(_ stream: SCStream, filter: SCContentFilter) {
+    focusGate?.cancel()
+    focusGate = nil
+    focusTransition = true
     generation += 1
     let token = generation
     startTask?.cancel()
@@ -163,17 +149,24 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
         guard let self, !self.destroyed, self.generation == token, self.stream === stream else {
           return
         }
+        self.focusTransition = false
         self.selectedApp = nil
+        self.selectedWindow = nil
         var label = "Live window preview"
         if #available(macOS 15.2, *), filter.includedWindows.count == 1,
           let owner = filter.includedWindows.first?.owningApplication
         {
           self.selectedApp = NSRunningApplication(processIdentifier: owner.processID)
+          if let window = filter.includedWindows.first, window.windowID != 0, owner.processID > 0 {
+            self.selectedWindow = WindowFocusIdentity(
+              windowID: window.windowID, pid: owner.processID)
+          }
           label = "Preview · \(owner.applicationName)"
         }
         self.onUpdate?(label, true)
       } catch {
         guard let self, !self.destroyed, self.generation == token else { return }
+        self.focusTransition = false
         self.onUpdate?("Capture update failed: \(error.localizedDescription)", false)
       }
     }
@@ -182,6 +175,8 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
   private func begin(_ filter: SCContentFilter) {
     guard picking, !destroyed else { return }
     endPicker()
+    cancelPendingFocus()
+    focusTransition = true
     generation += 1
     let token = generation
     startTask?.cancel()
@@ -192,6 +187,7 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
     let sourceHeight = max(1, rect.height * scale)
     let reduction = min(1, 1600 / sourceWidth, 1200 / sourceHeight)
     guard sourceWidth.isFinite, sourceHeight.isFinite, reduction.isFinite else {
+      focusTransition = false
       releasePickerIfIdle()
       onUpdate?("Capture dimensions are invalid", false)
       return
@@ -209,6 +205,7 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
     do {
       try candidate.addStreamOutput(processor, type: .screen, sampleHandlerQueue: processor.queue)
     } catch {
+      focusTransition = false
       releasePickerIfIdle()
       onUpdate?("Capture failed: \(error.localizedDescription)", false)
       return
@@ -216,11 +213,15 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
     pendingStream = candidate
     pendingFrame = nil
     var application: NSRunningApplication?
+    var identity: WindowFocusIdentity?
     var label = "Live window preview"
     if #available(macOS 15.2, *), filter.includedWindows.count == 1,
       let owner = filter.includedWindows.first?.owningApplication
     {
       application = NSRunningApplication(processIdentifier: owner.processID)
+      if let window = filter.includedWindows.first, window.windowID != 0, owner.processID > 0 {
+        identity = WindowFocusIdentity(windowID: window.windowID, pid: owner.processID)
+      }
       label = "Preview · \(owner.applicationName)"
     }
     startTask = Task { @MainActor [weak self] in
@@ -231,8 +232,12 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
           return
         }
         let previous = self.stream
+        self.focusGate?.cancel()
+        self.focusGate = nil
         self.stream = candidate
+        self.focusTransition = false
         self.selectedApp = application
+        self.selectedWindow = identity
         self.pendingStream = nil
         self.clearLayer()
         if let frame = self.pendingFrame { self.display(frame) }
@@ -243,6 +248,7 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
         guard let self, !self.destroyed, self.generation == token else { return }
         self.pendingStream = nil
         self.pendingFrame = nil
+        self.focusTransition = false
         self.releasePickerIfIdle()
         self.onUpdate?("Capture failed: \(error.localizedDescription)", false)
       }
@@ -250,6 +256,25 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
   }
 
   var canOpenApplication: Bool { selectedApp != nil }
+  var canFocusWindow: Bool {
+    !picking && !focusTransition && selectedWindow != nil && selectedApp != nil && stream != nil
+  }
+
+  func cancelPendingFocus() {
+    focusGate?.cancel()
+    focusGate = nil
+  }
+
+  func focusWindow(completion: @escaping @MainActor @Sendable (String) -> Void) {
+    guard canFocusWindow, let identity = selectedWindow, let app = selectedApp else {
+      completion("Selected window is no longer available.")
+      return
+    }
+    focusGate?.cancel()
+    let gate = WindowFocusGate()
+    focusGate = gate
+    requestWindowFocus(identity: identity, app: app, gate: gate, completion: completion)
+  }
 
   private func clearLayer() {
     layer.contents = nil
@@ -271,11 +296,16 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
   }
 
   func stop() {
+    WindowPickerCoordinator.shared.release(self)
     generation += 1
     endPicker()
     startTask?.cancel()
     startTask = nil
     selectedApp = nil
+    selectedWindow = nil
+    focusTransition = false
+    focusGate?.cancel()
+    focusGate = nil
     pendingStream = nil
     pendingFrame = nil
     clearLayer()
@@ -314,6 +344,7 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
         self.startTask?.cancel()
         self.pendingStream = nil
         self.pendingFrame = nil
+        self.focusTransition = false
         self.releasePickerIfIdle()
         self.onUpdate?("Capture stopped: \(message)", false)
         return
@@ -321,6 +352,10 @@ final class WindowCapture: NSObject, SCContentSharingPickerObserver, SCStreamDel
       guard self.stream === stream else { return }
       self.stream = nil
       self.selectedApp = nil
+      self.selectedWindow = nil
+      self.focusTransition = false
+      self.focusGate?.cancel()
+      self.focusGate = nil
       self.clearLayer()
       self.releasePickerIfIdle()
       self.onUpdate?("Capture stopped: \(message)", false)

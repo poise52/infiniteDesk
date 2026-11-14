@@ -67,7 +67,7 @@ struct App {
     #[cfg(all(target_os = "macos", feature = "native-browser"))]
     browser_mode: browser::Mode,
     #[cfg(all(target_os = "macos", feature = "native-browser"))]
-    browser: Option<browser::Browser>,
+    browsers: Vec<browser::Browser>,
     startup_focus: bool,
     benchmark_options: Option<cli::Options>,
     benchmark: Option<benchmark::Benchmark>,
@@ -133,7 +133,11 @@ impl ApplicationHandler<GpuError> for App {
             }
             #[cfg(all(target_os = "macos", feature = "native-browser"))]
             if self.browser_mode == browser::Mode::Browser {
-                self.browser = Some(browser::Browser::new(Arc::clone(&window))?);
+                self.board.fit_all();
+                for id in 0..browser::INITIAL_CARDS {
+                    self.browsers
+                        .push(browser::Browser::new(Arc::clone(&window), WindowId(id))?);
+                }
             }
             Ok((window, renderer))
         })();
@@ -182,7 +186,7 @@ impl ApplicationHandler<GpuError> for App {
             WindowEvent::CloseRequested => {
                 #[cfg(all(target_os = "macos", feature = "native-browser"))]
                 {
-                    self.browser = None;
+                    self.browsers.clear();
                 }
                 if let Some(benchmark) = &mut self.benchmark {
                     benchmark.incomplete = Some("window closed before completion".into());
@@ -317,6 +321,44 @@ impl ApplicationHandler<GpuError> for App {
                         self.space = event.state == ElementState::Pressed;
                     } else if event.state == ElementState::Pressed
                         && !event.repeat
+                        && key == KeyCode::Enter
+                        && self.modifiers.super_key()
+                    {
+                        #[cfg(all(target_os = "macos", feature = "native-browser"))]
+                        let browser_mode = self.browser_mode == browser::Mode::Browser;
+                        #[cfg(not(all(target_os = "macos", feature = "native-browser")))]
+                        let browser_mode = false;
+                        if browser_mode {
+                            #[cfg(all(target_os = "macos", feature = "native-browser"))]
+                            for browser in &self.browsers {
+                                browser.open_selected(self.board.selected);
+                            }
+                        } else {
+                            redraw = self.board.focus_selected();
+                            self.pointer_button = None;
+                        }
+                    } else if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && key == KeyCode::KeyN
+                    {
+                        #[cfg(all(target_os = "macos", feature = "native-browser"))]
+                        if self.browser_mode == browser::Mode::Browser {
+                            match browser::add_card(
+                                &mut self.board,
+                                &mut self.browsers,
+                                Arc::clone(window),
+                            ) {
+                                Ok(changed) => {
+                                    if changed {
+                                        self.pointer_button = None;
+                                    }
+                                    redraw = changed;
+                                }
+                                Err(error) => tracing::error!(%error, "failed to add card"),
+                            }
+                        }
+                    } else if event.state == ElementState::Pressed
+                        && !event.repeat
                         && let Some(changed) = route_key(
                             &mut self.board,
                             &mut self.pointer_button,
@@ -361,7 +403,7 @@ impl ApplicationHandler<GpuError> for App {
                     0.0
                 };
                 #[cfg(all(target_os = "macos", feature = "native-browser"))]
-                if let Some(browser) = &mut self.browser {
+                for browser in &mut self.browsers {
                     browser.update(&self.board);
                 }
                 match renderer.render(&self.board.scene, self.board.camera, self.board.selected) {
@@ -548,7 +590,7 @@ fn main() -> Result<()> {
             browser::Mode::Board
         },
         #[cfg(all(target_os = "macos", feature = "native-browser"))]
-        browser: None,
+        browsers: Vec::new(),
         startup_focus: options.focus.is_some(),
         benchmark_options: (options.mode == cli::Mode::Benchmark).then_some(options),
         benchmark: None,

@@ -28,10 +28,13 @@ func browserVisibleGeometry(
 }
 
 @MainActor private final class BrowserClip: NSView {
+  var occluders: [CGRect] = []
   override var isFlipped: Bool { true }
   override func hitTest(_ point: NSPoint) -> NSView? {
     let local = convert(point, from: superview)
-    guard bounds.contains(local), let child = subviews.first, child.frame.contains(local) else {
+    guard bounds.contains(local), !occluders.contains(where: { $0.contains(local) }),
+      let child = subviews.first, child.frame.contains(local)
+    else {
       return nil
     }
     return super.hitTest(point)
@@ -42,30 +45,43 @@ func browserVisibleGeometry(
   override var isFlipped: Bool { true }
 }
 
+@MainActor private final class PreviewView: NSView {
+  var onActivate: (() -> Void)?
+  override var acceptsFirstResponder: Bool { true }
+  override func mouseDown(with event: NSEvent) {
+    window?.makeFirstResponder(self)
+    onActivate?()
+  }
+}
+
 @MainActor
 private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate {
   let parent: NSView
+  let mask = CAShapeLayer()
   let clip = BrowserClip()
   let surface = BrowserSurface()
-  let webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+  var webView: WKWebView?
   let address = NSTextField()
   let back = NSButton(title: "‹", target: nil, action: nil)
   let forward = NSButton(title: "›", target: nil, action: nil)
   let home = NSButton(title: "⌂", target: nil, action: nil)
   let status = NSTextField(labelWithString: "")
   let capture = WindowCapture()
-  let preview = NSView()
+  let preview = PreviewView()
   let chooseWindow = NSButton(title: "Window…", target: nil, action: nil)
   let returnToWeb = NSButton(title: "Web", target: nil, action: nil)
   let openApp = NSButton(title: "Open app", target: nil, action: nil)
+  let focusWindow = NSButton(title: "Focus window", target: nil, action: nil)
   let chromeHeight: CGFloat = 44
   var escapeMonitor: Any?
 
-  init(parent: NSView) {
+  init(parent: NSView, id: UInt64, startWeb: Bool) {
     self.parent = parent
     super.init()
+    clip.setAccessibilityIdentifier("infinitedesk.card.\(id)")
     clip.wantsLayer = true
     clip.layer?.masksToBounds = true
+    clip.layer?.mask = mask
     clip.addSubview(surface)
     surface.wantsLayer = true
     surface.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
@@ -89,18 +105,23 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     returnToWeb.action = #selector(showWeb)
     openApp.target = self
     openApp.action = #selector(openSourceApplication)
+    focusWindow.target = self
+    focusWindow.action = #selector(focusSourceWindow)
+    preview.onActivate = { [weak self] in self?.focusSourceWindow() }
     preview.wantsLayer = true
     preview.layer?.addSublayer(capture.layer)
     preview.isHidden = true
     returnToWeb.isHidden = true
     openApp.isHidden = true
+    focusWindow.isHidden = true
     capture.onUpdate = { [weak self] message, started in
       guard let self else { return }
       self.status.stringValue = message
       self.status.isHidden = false
       self.openApp.isEnabled = self.capture.canOpenApplication
+      self.focusWindow.isEnabled = self.capture.canFocusWindow
       if started {
-        self.webView.isHidden = true
+        self.webView?.isHidden = true
         self.preview.isHidden = false
         self.back.isHidden = true
         self.forward.isHidden = true
@@ -108,39 +129,54 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
         self.address.isHidden = true
         self.returnToWeb.isHidden = false
         self.openApp.isHidden = !self.capture.canOpenApplication
+        self.focusWindow.isHidden = !self.capture.canFocusWindow
       }
     }
     surface.addSubview(back)
     surface.addSubview(forward)
     surface.addSubview(home)
     surface.addSubview(address)
-    surface.addSubview(webView)
     surface.addSubview(preview)
     surface.addSubview(chooseWindow)
     surface.addSubview(returnToWeb)
     surface.addSubview(openApp)
+    surface.addSubview(focusWindow)
     surface.addSubview(status)
-    webView.navigationDelegate = self
-    webView.uiDelegate = self
     parent.addSubview(clip)
     escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
       let handled = MainActor.assumeIsolated {
         guard let self, let window = self.parent.window, event.window === window,
-          event.keyCode == 53,
-          event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
           let responder = window.firstResponder
         else { return false }
         let inBrowser =
           (responder as? NSView)?.isDescendant(of: self.clip) == true
           || self.address.currentEditor() === responder
         guard inBrowser else { return false }
-        window.makeFirstResponder(self.parent)
-        return true
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if event.keyCode == 53 && modifiers.isEmpty {
+          window.makeFirstResponder(self.parent)
+          return true
+        }
+        if (event.keyCode == 36 || event.keyCode == 76) && modifiers == [.command]
+          && (responder as? NSView)?.isDescendant(of: self.preview) == true
+        {
+          self.focusSourceWindow()
+          return true
+        }
+        return false
       }
       return handled ? nil : event
     }
-    updateNavigation()
-    goHome()
+    if startWeb {
+      showWeb()
+    } else {
+      back.isHidden = true
+      forward.isHidden = true
+      home.isHidden = true
+      address.isHidden = true
+      returnToWeb.isHidden = false
+      status.stringValue = "Choose Web or Window…"
+    }
   }
 
   func setFrame(
@@ -163,6 +199,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     clip.isHidden = false
     if clip.frame != clipFrame { clip.frame = clipFrame }
     if clip.bounds != viewport { clip.bounds = viewport }
+    updateMask()
     if surface.frame != geometry.frame { surface.frame = geometry.frame }
     if surface.bounds != geometry.bounds { surface.bounds = geometry.bounds }
     func setFrame(_ view: NSView, _ frame: NSRect) {
@@ -174,19 +211,77 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     setFrame(address, NSRect(x: 106, y: 9, width: max(1, width - 220), height: 25))
     setFrame(chooseWindow, NSRect(x: width - 106, y: 7, width: 100, height: 30))
     setFrame(returnToWeb, NSRect(x: 6, y: 7, width: 70, height: 30))
-    setFrame(openApp, NSRect(x: 80, y: 7, width: 100, height: 30))
-    setFrame(webView, NSRect(x: 0, y: chromeHeight, width: width, height: height - chromeHeight))
+    setFrame(focusWindow, NSRect(x: 80, y: 7, width: 110, height: 30))
+    setFrame(openApp, NSRect(x: 194, y: 7, width: 100, height: 30))
+    if let webView {
+      setFrame(webView, NSRect(x: 0, y: chromeHeight, width: width, height: height - chromeHeight))
+    }
     setFrame(preview, NSRect(x: 0, y: chromeHeight, width: width, height: height - chromeHeight))
     capture.layer.frame = preview.bounds
     setFrame(status, NSRect(x: 8, y: height - 24, width: max(1, width - 16), height: 18))
     status.isHidden = status.stringValue.isEmpty
   }
 
+  func setOccluders(_ rectangles: [CGRect]) {
+    clip.occluders = rectangles.filter {
+      [$0.minX, $0.minY, $0.width, $0.height].allSatisfy(\.isFinite)
+        && $0.width > 0 && $0.height > 0
+    }
+    updateMask()
+  }
+
+  func updateMask() {
+    var remaining = [clip.bounds]
+    for blocker in clip.occluders {
+      remaining = remaining.flatMap { rect -> [CGRect] in
+        let overlap = rect.intersection(blocker)
+        guard !overlap.isNull, !overlap.isEmpty else { return [rect] }
+        return [
+          CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: overlap.minY - rect.minY),
+          CGRect(
+            x: rect.minX, y: overlap.maxY, width: rect.width, height: rect.maxY - overlap.maxY),
+          CGRect(
+            x: rect.minX, y: overlap.minY, width: overlap.minX - rect.minX, height: overlap.height),
+          CGRect(
+            x: overlap.maxX, y: overlap.minY, width: rect.maxX - overlap.maxX,
+            height: overlap.height),
+        ].filter { !$0.isEmpty }
+      }
+    }
+    let path = CGMutablePath()
+    for rect in remaining { path.addRect(clip.convertToLayer(rect)) }
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    mask.frame = clip.layer?.bounds ?? .zero
+    mask.path = path
+    CATransaction.commit()
+  }
+
   @objc func selectWindow() { capture.selectWindow() }
   @objc func openSourceApplication() { capture.openApplication() }
+  @objc func focusSourceWindow() {
+    guard capture.canFocusWindow else {
+      status.stringValue = "Window focus unavailable; use Open app."
+      status.isHidden = false
+      return
+    }
+    capture.focusWindow { [weak self] message in
+      self?.status.stringValue = message
+      self?.status.isHidden = false
+    }
+  }
   @objc func showWeb() {
     capture.stop()
-    webView.isHidden = false
+    let isNew = webView == nil
+    if isNew {
+      let view = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+      view.navigationDelegate = self
+      view.uiDelegate = self
+      surface.addSubview(view, positioned: .below, relativeTo: preview)
+      webView = view
+      view.frame = preview.frame
+    }
+    webView?.isHidden = false
     preview.isHidden = true
     back.isHidden = false
     forward.isHidden = false
@@ -194,13 +289,16 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     address.isHidden = false
     returnToWeb.isHidden = true
     openApp.isHidden = true
+    focusWindow.isHidden = true
     status.stringValue = ""
     status.isHidden = true
+    updateNavigation()
+    if isNew { goHome() }
   }
-  @objc func goBack() { if webView.canGoBack { webView.goBack() } }
-  @objc func goForward() { if webView.canGoForward { webView.goForward() } }
+  @objc func goBack() { if webView?.canGoBack == true { webView?.goBack() } }
+  @objc func goForward() { if webView?.canGoForward == true { webView?.goForward() } }
   @objc func goHome() {
-    guard let url = URL(string: homeAddress) else { return }
+    guard let url = URL(string: homeAddress), let webView else { return }
     address.stringValue = homeAddress
     status.stringValue = ""
     status.isHidden = true
@@ -219,13 +317,13 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     }
     status.stringValue = ""
     status.isHidden = true
-    webView.load(URLRequest(url: url))
+    webView?.load(URLRequest(url: url))
   }
   func updateNavigation(updateAddress: Bool = true) {
-    back.isEnabled = webView.canGoBack
-    forward.isEnabled = webView.canGoForward
+    back.isEnabled = webView?.canGoBack == true
+    forward.isEnabled = webView?.canGoForward == true
     guard updateAddress else { return }
-    if let url = webView.url, ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+    if let url = webView?.url, ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
       address.stringValue = url.absoluteString
     } else {
       address.stringValue = ""
@@ -265,22 +363,26 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     capture.destroy()
     if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
     escapeMonitor = nil
-    webView.stopLoading()
-    webView.navigationDelegate = nil
-    webView.uiDelegate = nil
+    webView?.stopLoading()
+    webView?.navigationDelegate = nil
+    webView?.uiDelegate = nil
+    webView = nil
     clip.removeFromSuperview()
   }
 }
 
-@_cdecl("desk_browser_create")
-public func deskBrowserCreate(_ parentPointer: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer?
-{
-  guard Thread.isMainThread, let parentPointer else { return nil }
+@_cdecl("desk_browser_create_card")
+public func deskBrowserCreateCard(
+  _ parentPointer: UnsafeMutableRawPointer?, _ id: UInt64, _ startWeb: UInt8
+) -> UnsafeMutableRawPointer? {
+  guard Thread.isMainThread, let parentPointer, startWeb <= 1 else { return nil }
   let parentAddress = UInt(bitPattern: parentPointer)
   let address = MainActor.assumeIsolated {
     guard let raw = UnsafeMutableRawPointer(bitPattern: parentAddress) else { return UInt(0) }
     let parent = Unmanaged<NSView>.fromOpaque(raw).takeUnretainedValue()
-    return UInt(bitPattern: Unmanaged.passRetained(Browser(parent: parent)).toOpaque())
+    return UInt(
+      bitPattern: Unmanaged.passRetained(Browser(parent: parent, id: id, startWeb: startWeb == 1))
+        .toOpaque())
   }
   return UnsafeMutableRawPointer(bitPattern: address)
 }
@@ -298,6 +400,34 @@ public func deskBrowserSetFrame(
     Unmanaged<Browser>.fromOpaque(raw).takeUnretainedValue().setFrame(
       x: x, y: y, width: width, height: height, zoom: zoom,
       viewportWidth: viewportWidth, viewportHeight: viewportHeight)
+  }
+}
+
+@_cdecl("desk_browser_set_occluders")
+public func deskBrowserSetOccluders(
+  _ pointer: UnsafeMutableRawPointer?,
+  _ x1: Double, _ y1: Double, _ w1: Double, _ h1: Double,
+  _ x2: Double, _ y2: Double, _ w2: Double, _ h2: Double
+) {
+  guard Thread.isMainThread, let pointer else { return }
+  let address = UInt(bitPattern: pointer)
+  MainActor.assumeIsolated {
+    guard let raw = UnsafeMutableRawPointer(bitPattern: address) else { return }
+    Unmanaged<Browser>.fromOpaque(raw).takeUnretainedValue().setOccluders([
+      CGRect(x: x1, y: y1, width: w1, height: h1),
+      CGRect(x: x2, y: y2, width: w2, height: h2),
+    ])
+  }
+}
+
+@_cdecl("desk_browser_open_source")
+public func deskBrowserOpenSource(_ pointer: UnsafeMutableRawPointer?) {
+  guard Thread.isMainThread, let pointer else { return }
+  let address = UInt(bitPattern: pointer)
+  MainActor.assumeIsolated {
+    guard let raw = UnsafeMutableRawPointer(bitPattern: address) else { return }
+    let browser = Unmanaged<Browser>.fromOpaque(raw).takeUnretainedValue()
+    if !browser.preview.isHidden { browser.focusSourceWindow() }
   }
 }
 

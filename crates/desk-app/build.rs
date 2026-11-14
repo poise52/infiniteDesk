@@ -36,6 +36,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .args(["-emit-library", "-module-name", "DeskBrowser"])
         .arg(&source)
         .arg(source.with_file_name("WindowCapture.swift"))
+        .arg(source.with_file_name("WindowFocus.swift"))
+        .arg(source.with_file_name("PickerCoordinator.swift"))
         .args([
             "-Xlinker",
             "-install_name",
