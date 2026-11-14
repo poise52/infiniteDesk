@@ -2,6 +2,7 @@ import AppKit
 @preconcurrency import ApplicationServices
 import Darwin
 import Foundation
+import OSLog
 
 struct DesktopProcessIdentity: Equatable, Sendable {
   let seconds: UInt64
@@ -17,7 +18,7 @@ struct DesktopProcessIdentity: Equatable, Sendable {
 
 struct DesktopApplicationSnapshot: Sendable {
   let pid: pid_t
-  let launchDate: Date
+  let launchDate: Date?
   let appName: String
   let bundleIdentifier: String?
   let processIdentity: DesktopProcessIdentity
@@ -29,7 +30,13 @@ struct DesktopWindow: Identifiable, Sendable {
   let appName: String
   let title: String
   let originalFrame: CGRect
-  let launchDate: Date
+  let launchDate: Date?
+  let processIdentity: DesktopProcessIdentity
+}
+
+func desktopLaunchDatesCompatible(expected: Date?, actual: Date?) -> Bool {
+  guard let expected, let actual else { return true }
+  return expected == actual
 }
 
 enum DesktopWindowError: LocalizedError, Sendable {
@@ -204,7 +211,8 @@ final class DesktopWindowBackend: @unchecked Sendable {
       application: application, app: app, window: window,
       snapshot: DesktopWindow(
         id: UUID(), pid: application.pid, appName: application.appName, title: "",
-        originalFrame: .zero, launchDate: application.launchDate))
+        originalFrame: .zero, launchDate: application.launchDate,
+        processIdentity: application.processIdentity))
     try validateWindow(temporary, operation)
     if let existing = records.values.first(where: {
       $0.application.processIdentity == application.processIdentity
@@ -220,7 +228,8 @@ final class DesktopWindowBackend: @unchecked Sendable {
     let snapshot = DesktopWindow(
       id: UUID(), pid: application.pid, appName: application.appName,
       title: title.isEmpty ? "Untitled window" : title,
-      originalFrame: try frame(window, operation), launchDate: application.launchDate)
+      originalFrame: try frame(window, operation), launchDate: application.launchDate,
+      processIdentity: application.processIdentity)
     guard let focused = try read(app, kAXFocusedWindowAttribute, operation), CFEqual(focused, window)
     else { throw DesktopWindowError.message("Focus changed during registration. Retry with the intended window.") }
     try validateProcess(application, operation)
@@ -316,7 +325,8 @@ final class DesktopWindowClient {
   private let backend = DesktopWindowBackend()
   private var operation: DesktopOperation?
   private var timeout: DispatchWorkItem?
-  private var applications: [UUID: NSRunningApplication] = [:]
+  private var applications: [UUID: DesktopApplicationSnapshot] = [:]
+  private static let snapshotLogger = Logger(subsystem: "dev.infinitedesk.desktop", category: "snapshot")
   private var closed = false
   private(set) var windows: [DesktopWindow] = []
 
@@ -328,13 +338,31 @@ final class DesktopWindowClient {
   }
 
   static func snapshot(_ app: NSRunningApplication?) -> DesktopApplicationSnapshot? {
-    guard let app, app.processIdentifier != getpid(), !app.isTerminated,
-      app.activationPolicy == .regular, let launchDate = app.launchDate,
-      let identity = DesktopProcessIdentity.read(pid: app.processIdentifier)
-    else { return nil }
+    guard let app else {
+      snapshotLogger.error("snapshot rejected reason=no_frontmost_application")
+      return nil
+    }
+    let pid = app.processIdentifier
+    guard pid != getpid() else {
+      snapshotLogger.error("snapshot rejected reason=own_application pid=\(pid)")
+      return nil
+    }
+    guard !app.isTerminated else {
+      snapshotLogger.error("snapshot rejected reason=terminated pid=\(pid)")
+      return nil
+    }
+    guard app.activationPolicy == .regular else {
+      snapshotLogger.error("snapshot rejected reason=not_regular pid=\(pid) policy=\(app.activationPolicy.rawValue)")
+      return nil
+    }
+    guard let identity = DesktopProcessIdentity.read(pid: pid) else {
+      snapshotLogger.error("snapshot rejected reason=unavailable_process_identity pid=\(pid) errno=\(errno)")
+      return nil
+    }
+    snapshotLogger.info("snapshot accepted pid=\(pid) launch_date_available=\(app.launchDate != nil)")
     return DesktopApplicationSnapshot(
-      pid: app.processIdentifier, launchDate: launchDate,
-      appName: app.localizedName ?? "Application \(app.processIdentifier)",
+      pid: pid, launchDate: app.launchDate,
+      appName: app.localizedName ?? "Application \(pid)",
       bundleIdentifier: app.bundleIdentifier, processIdentity: identity)
   }
 
@@ -380,8 +408,8 @@ final class DesktopWindowClient {
 
   private func liveApplication(_ snapshot: DesktopApplicationSnapshot) -> NSRunningApplication? {
     guard let app = NSRunningApplication(processIdentifier: snapshot.pid), !app.isTerminated,
-      app.launchDate == snapshot.launchDate,
-      DesktopProcessIdentity.read(pid: snapshot.pid) == snapshot.processIdentity
+      DesktopProcessIdentity.read(pid: snapshot.pid) == snapshot.processIdentity,
+      desktopLaunchDatesCompatible(expected: snapshot.launchDate, actual: app.launchDate)
     else { return nil }
     return app
   }
@@ -391,7 +419,7 @@ final class DesktopWindowClient {
     completion: @escaping @MainActor @Sendable (Result<DesktopWindow, DesktopWindowError>) -> Void
   ) {
     guard let operation = begin(completion: completion) else { return }
-    guard let app = liveApplication(application) else {
+    guard liveApplication(application) != nil else {
       finish(operation: operation, result: .failure(.message("The application exited. Select its window again.")), completion: completion)
       return
     }
@@ -403,7 +431,7 @@ final class DesktopWindowClient {
         guard let self, self.operation === operation else { return }
         var final = result
         if case .success(let window) = result {
-          guard self.liveApplication(application) == app else {
+          guard self.liveApplication(application) != nil else {
             self.finish(operation: operation, result: .failure(.message("The application exited during registration.")), completion: completion)
             return
           }
@@ -411,7 +439,7 @@ final class DesktopWindowClient {
             try operation.check()
             backend.queue.async { backend.commit(id: window.id, operation: operation) }
             if !self.windows.contains(where: { $0.id == window.id }) { self.windows.append(window) }
-            self.applications[window.id] = app
+            self.applications[window.id] = application
           } catch {
             backend.queue.async { backend.discardPending() }
             final = .failure(.message("Window registration timed out."))
@@ -427,9 +455,8 @@ final class DesktopWindowClient {
     completion: @escaping @MainActor @Sendable (Result<DesktopWindow, DesktopWindowError>) -> Void
   ) {
     guard let operation = begin(completion: completion) else { return }
-    guard let app = applications[id], !app.isTerminated,
-      let window = windows.first(where: { $0.id == id }), app.launchDate == window.launchDate,
-      NSRunningApplication(processIdentifier: window.pid) == app
+    guard let application = applications[id],
+      let app = liveApplication(application), windows.contains(where: { $0.id == id })
     else {
       finish(operation: operation, result: .failure(.message("The registered application exited. Register its window again.")), completion: completion)
       return
@@ -448,8 +475,8 @@ final class DesktopWindowClient {
       DispatchQueue.main.async { [weak self] in
         guard let self, self.operation === operation else { return }
         do { try operation.check() } catch { return }
-        guard !app.isTerminated, NSRunningApplication(processIdentifier: window.pid) == app,
-          app.launchDate == window.launchDate, app.activate()
+        guard self.liveApplication(application) != nil,
+          NSWorkspace.shared.frontmostApplication?.processIdentifier == application.pid || app.activate()
         else {
           self.finish(operation: operation, result: .failure(.message("The selected application could not activate.")), completion: completion)
           return
@@ -461,7 +488,7 @@ final class DesktopWindowClient {
           }.mapError { ($0 as? DesktopWindowError) ?? .message($0.localizedDescription) }
           DispatchQueue.main.async { [weak self] in
             self?.finishFocus(
-              id: id, app: app, operation: operation, result: result,
+              id: id, application: application, operation: operation, result: result,
               allowMainFallback: true, completion: completion)
           }
         }
@@ -470,12 +497,14 @@ final class DesktopWindowClient {
   }
 
   private func finishFocus(
-    id: UUID, app: NSRunningApplication, operation: DesktopOperation,
+    id: UUID, application: DesktopApplicationSnapshot, operation: DesktopOperation,
     result: Result<DesktopWindow, DesktopWindowError>, allowMainFallback: Bool,
     completion: @escaping @MainActor @Sendable (Result<DesktopWindow, DesktopWindowError>) -> Void
   ) {
     guard self.operation === operation else { return }
-    guard !app.isTerminated, NSWorkspace.shared.frontmostApplication == app else {
+    guard liveApplication(application) != nil,
+      NSWorkspace.shared.frontmostApplication?.processIdentifier == application.pid
+    else {
       finish(operation: operation, result: .failure(.message("The selected application did not retain keyboard focus.")), completion: completion)
       return
     }
@@ -489,7 +518,7 @@ final class DesktopWindowClient {
         }.mapError { ($0 as? DesktopWindowError) ?? .message($0.localizedDescription) }
         DispatchQueue.main.async { [weak self] in
           self?.finishFocus(
-            id: id, app: app, operation: operation, result: fallback,
+            id: id, application: application, operation: operation, result: fallback,
             allowMainFallback: false, completion: completion)
         }
       }

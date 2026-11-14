@@ -1,5 +1,8 @@
 import AppKit
 import Carbon
+import OSLog
+
+private let desktopHotkeyLogger = Logger(subsystem: "dev.infinitedesk.desktop", category: "focus")
 
 enum DesktopShortcut: UInt32, CaseIterable {
   case register = 1
@@ -46,7 +49,10 @@ final class DesktopHotkeys {
         let result = GetEventParameter(
           event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
           nil, MemoryLayout<EventHotKeyID>.size, nil, &identifier)
-        guard result == noErr else { return result }
+        guard result == noErr else {
+          desktopHotkeyLogger.error("hotkey event decode failed osstatus=\(result)")
+          return result
+        }
         // Application event handlers are dispatched by NSApplication's main event loop.
         return MainActor.assumeIsolated {
           guard identifier.signature == DesktopHotkeys.signature,
@@ -57,6 +63,7 @@ final class DesktopHotkeys {
         }
       }, 1, &event, Unmanaged.passUnretained(self).toOpaque(), &handler)
     guard installed == noErr else {
+      desktopHotkeyLogger.error("hotkeys handler install failed osstatus=\(installed)")
       return "Global shortcuts unavailable (event handler: \(installed)). Use the menu."
     }
     var unavailable: [String] = []
@@ -69,6 +76,7 @@ final class DesktopHotkeys {
       if result == noErr, let reference {
         references.append(reference)
       } else {
+        desktopHotkeyLogger.error("hotkey registration failed command=\(shortcut.label, privacy: .public) keycode=\(shortcut.keyCode) osstatus=\(result) reference_present=\(reference != nil)")
         unavailable.append("\(shortcut.label) (\(result))")
       }
     }

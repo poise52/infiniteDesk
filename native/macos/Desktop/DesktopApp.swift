@@ -1,8 +1,10 @@
 import AppKit
 import ApplicationServices
+import OSLog
 
 @MainActor
 final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
+  private let logger = Logger(subsystem: "dev.infinitedesk.desktop", category: "focus")
   private let client = DesktopWindowClient()
   private var statusItem: NSStatusItem?
   private let menu = NSMenu()
@@ -17,6 +19,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var shortcutWarning: String?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
+    logger.info("manager launched pid=\(ProcessInfo.processInfo.processIdentifier) trusted=\(self.trusted) windows=\(self.client.windows.count)")
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     item.autosaveName = "InfiniteDeskDesktop"
     if let image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "InfiniteDesk") {
@@ -74,6 +77,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   private func handle(_ shortcut: DesktopShortcut) {
+    logCommand(shortcut.label, source: "global")
     switch shortcut {
     case .register: register(application: externalApplication())
     case .previous: cycle(direction: -1)
@@ -84,11 +88,13 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private func register(application: DesktopApplicationSnapshot?) {
     guard requirePermission() else { return }
     guard let application else {
+      logger.error("capture rejected reason=no_frontmost_application windows=\(self.client.windows.count)")
       status = "Focus another application's window, then press \(DesktopShortcut.register.label)."
       updateMenu()
       return
     }
     cycleCursorID = nil
+    logger.info("capture begin pid=\(application.pid) windows=\(self.client.windows.count)")
     status = "Registering the focused window of \(application.appName)…"
     updateMenu()
     client.captureFocused(application: application) { [weak self] result in
@@ -99,9 +105,11 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
           self.registrationNumbers[window.id] = self.nextRegistrationNumber
           self.nextRegistrationNumber += 1
         }
+        self.logger.info("capture result=success pid=\(window.pid) number=\(self.registrationNumbers[window.id] ?? 0) windows=\(self.client.windows.count)")
         self.selectedID = window.id
         self.status = "Registered: \(self.label(window))"
       case .failure(let error):
+        self.logger.error("capture result=failure pid=\(application.pid) reason=\(error.localizedDescription, privacy: .public) windows=\(self.client.windows.count)")
         self.status = error.localizedDescription
       }
       self.updateMenu()
@@ -112,6 +120,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     guard requirePermission() else { return }
     let windows = client.windows
     guard !windows.isEmpty else {
+      logger.error("cycle rejected reason=no_registered_windows direction=\(direction) windows=0")
       status = "No registered windows. Press \(DesktopShortcut.register.label) in a window."
       updateMenu()
       return
@@ -129,15 +138,18 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private func select(id: UUID) {
     guard requirePermission(), let window = client.windows.first(where: { $0.id == id }) else { return }
     cycleCursorID = id
+    logger.info("focus begin pid=\(window.pid) number=\(self.registrationNumbers[id] ?? 0) windows=\(self.client.windows.count)")
     status = "Focusing: \(label(window))…"
     updateMenu()
     client.focus(id: id) { [weak self] result in
       guard let self else { return }
       switch result {
       case .success(let focused):
+        self.logger.info("focus result=success pid=\(focused.pid) number=\(self.registrationNumbers[id] ?? 0) windows=\(self.client.windows.count)")
         self.selectedID = focused.id
         self.status = "Focused: \(self.label(focused))"
       case .failure(let error):
+        self.logger.error("focus result=failure pid=\(window.pid) number=\(self.registrationNumbers[id] ?? 0) reason=\(error.localizedDescription, privacy: .public) windows=\(self.client.windows.count)")
         self.status = error.localizedDescription
       }
       self.updateMenu()
@@ -147,11 +159,16 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private func requirePermission() -> Bool {
     checkPermission()
     guard trusted else {
+      logger.error("command rejected reason=accessibility_denied windows=\(self.client.windows.count)")
       status = "Allow InfiniteDesk in Privacy & Security → Accessibility."
       updateMenu()
       return false
     }
     return true
+  }
+
+  private func logCommand(_ command: String, source: String) {
+    logger.info("command received command=\(command, privacy: .public) source=\(source, privacy: .public) windows=\(self.client.windows.count)")
   }
 
   private func label(_ window: DesktopWindow) -> String {
@@ -219,11 +236,21 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     return item
   }
 
-  @objc private func registerFromMenu() { register(application: menuApplication) }
-  @objc private func previousFromMenu() { cycle(direction: -1) }
-  @objc private func nextFromMenu() { cycle(direction: 1) }
+  @objc private func registerFromMenu() {
+    logCommand("register", source: "menu")
+    register(application: menuApplication)
+  }
+  @objc private func previousFromMenu() {
+    logCommand("previous", source: "menu")
+    cycle(direction: -1)
+  }
+  @objc private func nextFromMenu() {
+    logCommand("next", source: "menu")
+    cycle(direction: 1)
+  }
   @objc private func selectFromMenu(_ item: NSMenuItem) {
     guard let value = item.representedObject as? String, let id = UUID(uuidString: value) else { return }
+    logCommand("focus", source: "menu")
     select(id: id)
   }
   @objc private func forgetFromMenu(_ item: NSMenuItem) {

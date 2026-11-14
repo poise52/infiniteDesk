@@ -257,4 +257,25 @@ try backend.queue.sync {
   require(!ax.mutations.contains(kAXPositionAttribute), "All focus paths must have zero AXPosition writes")
   require(!ax.mutations.contains(kAXSizeAttribute), "All focus paths must have zero AXSize writes")
 }
+require(desktopLaunchDatesCompatible(expected: nil, actual: nil), "Missing Launch Services dates must not invalidate a process fingerprint")
+require(desktopLaunchDatesCompatible(expected: application.launchDate, actual: nil), "Unavailable current launchDate must not invalidate the same process")
+require(desktopLaunchDatesCompatible(expected: nil, actual: application.launchDate), "An initially unavailable launchDate must remain usable")
+require(!desktopLaunchDatesCompatible(expected: Date(timeIntervalSince1970: 1), actual: Date(timeIntervalSince1970: 2)), "Conflicting known dates must be rejected")
+let undatedApplication = DesktopApplicationSnapshot(
+  pid: application.pid, launchDate: nil, appName: application.appName,
+  bundleIdentifier: application.bundleIdentifier, processIdentity: birth)
+try backend.queue.sync {
+  let operation = DesktopOperation()
+  let window = try backend.capture(application: undatedApplication, operation: operation)
+  backend.commit(id: window.id, operation: operation)
+  require(window.launchDate == nil && window.processIdentity == birth, "Standalone applications must register using mandatory PID + process start")
+  try backend.raise(id: window.id, operation: operation)
+  _ = try backend.confirm(id: window.id, operation: operation)
+  process.replace(DesktopProcessIdentity(seconds: birth.seconds + 1, microseconds: birth.microseconds))
+  requireFailure("An undated application must still reject PID recycling") {
+    try backend.raise(id: window.id, operation: DesktopOperation())
+  }
+  process.replace(birth)
+}
+require(DesktopProcessIdentity.read(pid: getpid()) != nil, "libproc must identify this actual test subprocess")
 print("Desktop adapter tests passed: exact AX identity, original bounds, cancellation, disappearance, PID reuse, confirmed focus, zero geometry writes.")
