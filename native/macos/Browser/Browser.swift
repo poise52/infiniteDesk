@@ -74,6 +74,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
   let focusWindow = NSButton(title: "Focus window", target: nil, action: nil)
   let chromeHeight: CGFloat = 44
   var escapeMonitor: Any?
+  var selected = false
 
   init(parent: NSView, id: UInt64, startWeb: Bool) {
     self.parent = parent
@@ -145,9 +146,13 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     parent.addSubview(clip)
     escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
       let handled = MainActor.assumeIsolated {
-        guard let self, let window = self.parent.window, event.window === window,
-          let responder = window.firstResponder
-        else { return false }
+        guard let self, let window = self.parent.window, event.window === window else { return false }
+        if routeFocusShortcut(
+          keyCode: event.keyCode, modifiers: event.modifierFlags,
+          isRepeat: event.isARepeat, selected: self.selected && !self.preview.isHidden,
+          focus: { self.focusSourceWindow() })
+        { return true }
+        guard let responder = window.firstResponder else { return false }
         let inBrowser =
           (responder as? NSView)?.isDescendant(of: self.clip) == true
           || self.address.currentEditor() === responder
@@ -155,12 +160,6 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
         if event.keyCode == 53 && modifiers.isEmpty {
           window.makeFirstResponder(self.parent)
-          return true
-        }
-        if (event.keyCode == 36 || event.keyCode == 76) && modifiers == [.command]
-          && (responder as? NSView)?.isDescendant(of: self.preview) == true
-        {
-          self.focusSourceWindow()
           return true
         }
         return false
@@ -420,14 +419,15 @@ public func deskBrowserSetOccluders(
   }
 }
 
-@_cdecl("desk_browser_open_source")
-public func deskBrowserOpenSource(_ pointer: UnsafeMutableRawPointer?) {
+@_cdecl("desk_browser_set_selected")
+public func deskBrowserSetSelected(_ pointer: UnsafeMutableRawPointer?, _ selected: UInt8) {
   guard Thread.isMainThread, let pointer else { return }
   let address = UInt(bitPattern: pointer)
   MainActor.assumeIsolated {
     guard let raw = UnsafeMutableRawPointer(bitPattern: address) else { return }
     let browser = Unmanaged<Browser>.fromOpaque(raw).takeUnretainedValue()
-    if !browser.preview.isHidden { browser.focusSourceWindow() }
+    if browser.selected && selected != 1 { browser.capture.cancelPendingFocus() }
+    browser.selected = selected == 1
   }
 }
 

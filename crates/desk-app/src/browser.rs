@@ -35,7 +35,7 @@ unsafe extern "C" {
         w2: f64,
         h2: f64,
     );
-    fn desk_browser_open_source(handle: *mut c_void);
+    fn desk_browser_set_selected(handle: *mut c_void, selected: u8);
     fn desk_browser_destroy(handle: *mut c_void);
 }
 
@@ -108,11 +108,11 @@ impl Browser {
         })
     }
 
-    pub fn open_selected(&self, selected: Option<WindowId>) {
-        if selected == Some(self.id) {
-            // SAFETY: the owned handle and parent window remain alive on the main thread.
-            unsafe { desk_browser_open_source(self.handle.as_ptr()) };
-        }
+    pub fn set_selected(&self, selected: Option<WindowId>) {
+        // SAFETY: the owned handle and parent window remain alive on the main thread.
+        unsafe {
+            desk_browser_set_selected(self.handle.as_ptr(), u8::from(selected == Some(self.id)))
+        };
     }
 
     fn hide(&mut self) {

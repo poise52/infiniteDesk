@@ -9,6 +9,7 @@ cache="$root/target/browser-capture-test/module-cache"
 xcrun swiftc -swift-version 6 -warnings-as-errors -target "$arch-apple-macosx15.0" \
   -module-cache-path "$cache" -D FOCUS_TESTING \
   "$root/native/macos/Browser/WindowFocus.swift" \
+  "$root/native/macos/Browser/Shortcut.swift" \
   "$root/native/macos/Browser/Tests/Focus/main.swift" -o "$build/focus-test"
 if [ "${1-}" = --integration ]; then
   xcrun swiftc -swift-version 6 -warnings-as-errors -target "$arch-apple-macosx15.0" \

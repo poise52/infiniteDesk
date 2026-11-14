@@ -3,6 +3,30 @@ import AppKit
 import CoreGraphics
 import Foundation
 
+func testShortcutRouting() -> Bool {
+  var calls = [0, 0]
+  func dispatch(selected: Int, repeatKey: Bool, modifiers: NSEvent.ModifierFlags = .command) -> [Bool] {
+    (0..<2).map { index in
+      routeFocusShortcut(keyCode: 36, modifiers: modifiers, isRepeat: repeatKey,
+        selected: index == selected, focus: { calls[index] += 1 })
+    }
+  }
+  guard dispatch(selected: 1, repeatKey: false) == [false, true], calls == [0, 1],
+    dispatch(selected: 1, repeatKey: true) == [false, true], calls == [0, 1],
+    dispatch(selected: 0, repeatKey: false) == [true, false], calls == [1, 1],
+    dispatch(selected: 0, repeatKey: false, modifiers: [.command, .shift]) == [false, false],
+    calls == [1, 1]
+  else { return false }
+  return routeFocusShortcut(keyCode: 76, modifiers: .command, isRepeat: false,
+    selected: true, focus: { calls[0] += 1 }) && calls == [2, 1]
+}
+
+guard testShortcutRouting() else {
+  print("FAIL: selected-card shortcut routing")
+  exit(1)
+}
+print("PASS: selected card, repeated keys, modifiers and keypad Enter")
+
 func testMatching() -> Bool {
   let a = CGRect(x: 10, y: 20, width: 100, height: 100)
   let b = CGRect(x: 300, y: 20, width: 120, height: 110)

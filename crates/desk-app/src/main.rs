@@ -138,6 +138,9 @@ impl ApplicationHandler<GpuError> for App {
                     self.browsers
                         .push(browser::Browser::new(Arc::clone(&window), WindowId(id))?);
                 }
+                for browser in &self.browsers {
+                    browser.set_selected(self.board.selected);
+                }
             }
             Ok((window, renderer))
         })();
@@ -169,6 +172,8 @@ impl ApplicationHandler<GpuError> for App {
         }
         let now = Instant::now();
         let mut redraw = false;
+        #[cfg(all(target_os = "macos", feature = "native-browser"))]
+        let previous_selection = self.board.selected;
         if self.benchmark.is_some()
             && matches!(
                 event,
@@ -328,12 +333,7 @@ impl ApplicationHandler<GpuError> for App {
                         let browser_mode = self.browser_mode == browser::Mode::Browser;
                         #[cfg(not(all(target_os = "macos", feature = "native-browser")))]
                         let browser_mode = false;
-                        if browser_mode {
-                            #[cfg(all(target_os = "macos", feature = "native-browser"))]
-                            for browser in &self.browsers {
-                                browser.open_selected(self.board.selected);
-                            }
-                        } else {
+                        if !browser_mode {
                             redraw = self.board.focus_selected();
                             self.pointer_button = None;
                         }
@@ -457,6 +457,12 @@ impl ApplicationHandler<GpuError> for App {
                 }
             }
             _ => {}
+        }
+        #[cfg(all(target_os = "macos", feature = "native-browser"))]
+        if self.board.selected != previous_selection {
+            for browser in &self.browsers {
+                browser.set_selected(self.board.selected);
+            }
         }
         if redraw && !self.occluded && self.retry.deadline.is_none() {
             window.request_redraw();

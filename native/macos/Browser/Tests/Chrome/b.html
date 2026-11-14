@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>InfiniteDesk Chrome B</title>
+<style>
+body { font: 20px system-ui, sans-serif; margin: 36px; color: #18212a; }
+h1 { color: #a23823; font-size: 42px; }
+label { display: block; margin: 24px 0; }
+input { display: block; width: 28em; max-width: 90%; font: inherit; padding: 8px; }
+output { overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<h1>Chrome window B</h1>
+<p>This is the local fixture for window B.</p>
+<label>Target text <input id="target" value="TARGET-B" autocomplete="off"></label>
+<label>Neutral decoy <input id="decoy" value="DECOY-B" autocomplete="off"></label>
+<p>Target value: <output id="value"></output></p>
+<p>Page visibility: <output id="visibility"></output>; page has focus: <output id="focus"></output></p>
+<script>
+const target = document.getElementById('target');
+function refresh() {
+  document.getElementById('value').textContent = target.value;
+  document.getElementById('visibility').textContent = document.visibilityState;
+  document.getElementById('focus').textContent = String(document.hasFocus());
+}
+target.addEventListener('input', refresh);
+document.addEventListener('visibilitychange', refresh);
+window.addEventListener('focus', refresh);
+window.addEventListener('blur', refresh);
+refresh();
+</script>
+</body>
+</html>
