@@ -12,6 +12,12 @@ The deployment target is macOS 15.0; graphical behavior has been tested on macOS
 
 ## Run and verify
 
+On an Apple Silicon Mac, run `./scripts/build-macos-app.sh` and double-click
+`target/InfiniteDesk.app` in Finder. The demo opens with 1,000 virtual windows.
+Drag a window to move it, hold Space while dragging to move around the board,
+and use a trackpad pinch to zoom. Press F to see the whole scene and R to reset
+the camera.
+
 Install the optional verification tools with:
 
 ```sh
