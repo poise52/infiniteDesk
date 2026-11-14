@@ -6,12 +6,15 @@ import OSLog
 final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private let logger = Logger(subsystem: "dev.infinitedesk.desktop", category: "focus")
   private let client = DesktopWindowClient()
+  private let testState = DesktopTestState.configured()
   private var statusItem: NSStatusItem?
   private let menu = NSMenu()
   private var hotkeys: DesktopHotkeys?
   private var menuApplication: DesktopApplicationSnapshot?
   private var selectedID: UUID?
   private var cycleCursorID: UUID?
+  private var pendingFocusID: UUID?
+  private var observedFocusedID: UUID?
   private var registrationNumbers: [UUID: Int] = [:]
   private var nextRegistrationNumber = 1
   private var trusted = DesktopWindowClient.accessibilityTrusted
@@ -33,15 +36,20 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     statusItem = item
     menu.delegate = self
     menu.autoenablesItems = false
+    client.onChange = { [weak self] in self?.modelDidChange() }
+    client.setAccessibilityTrusted(trusted)
     let hotkeys = DesktopHotkeys { [weak self] shortcut in
       self?.handle(shortcut)
     }
     self.hotkeys = hotkeys
     shortcutWarning = hotkeys.start()
-    updateMenu()
+    modelDidChange()
+    updateStatus()
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    client.onChange = nil
+    testState?.stop()
     hotkeys?.stop()
     hotkeys = nil
     client.close()
@@ -52,7 +60,18 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func menuWillOpen(_ menu: NSMenu) {
     menuApplication = externalApplication()
     checkPermission()
-    updateMenu()
+    rebuildMenu()
+  }
+
+  private func modelDidChange() {
+    if observedFocusedID != client.focusedID {
+      observedFocusedID = client.focusedID
+      if let focusedID = client.focusedID, pendingFocusID == nil {
+        selectedID = focusedID
+        cycleCursorID = nil
+      }
+    }
+    testState?.publish(windows: client.windows, focusedID: client.focusedID)
   }
 
   private func externalApplication() -> DesktopApplicationSnapshot? {
@@ -66,14 +85,16 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let current = DesktopWindowClient.accessibilityTrusted
     guard trusted != current else { return }
     trusted = current
+    client.setAccessibilityTrusted(current)
     if !current {
       client.cancel()
       cycleCursorID = nil
+      pendingFocusID = nil
       status = "Accessibility permission is required."
     } else {
       status = "Accessibility enabled. Register a focused window."
     }
-    updateMenu()
+    updateStatus()
   }
 
   private func handle(_ shortcut: DesktopShortcut) {
@@ -90,13 +111,14 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     guard let application else {
       logger.error("capture rejected reason=no_frontmost_application windows=\(self.client.windows.count)")
       status = "Focus another application's window, then press \(DesktopShortcut.register.label)."
-      updateMenu()
+      updateStatus()
       return
     }
     cycleCursorID = nil
+    pendingFocusID = nil
     logger.info("capture begin pid=\(application.pid) windows=\(self.client.windows.count)")
     status = "Registering the focused window of \(application.appName)…"
-    updateMenu()
+    updateStatus()
     client.captureFocused(application: application) { [weak self] result in
       guard let self else { return }
       switch result {
@@ -112,7 +134,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.logger.error("capture result=failure pid=\(application.pid) reason=\(error.localizedDescription, privacy: .public) windows=\(self.client.windows.count)")
         self.status = error.localizedDescription
       }
-      self.updateMenu()
+      self.updateStatus()
     }
   }
 
@@ -122,10 +144,10 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     guard !windows.isEmpty else {
       logger.error("cycle rejected reason=no_registered_windows direction=\(direction) windows=0")
       status = "No registered windows. Press \(DesktopShortcut.register.label) in a window."
-      updateMenu()
+      updateStatus()
       return
     }
-    let origin = cycleCursorID ?? selectedID
+    let origin = cycleCursorID ?? client.focusedID ?? selectedID
     let index: Int
     if let current = windows.firstIndex(where: { $0.id == origin }) {
       index = (current + direction + windows.count) % windows.count
@@ -138,11 +160,13 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private func select(id: UUID) {
     guard requirePermission(), let window = client.windows.first(where: { $0.id == id }) else { return }
     cycleCursorID = id
+    pendingFocusID = id
     logger.info("focus begin pid=\(window.pid) number=\(self.registrationNumbers[id] ?? 0) windows=\(self.client.windows.count)")
     status = "Focusing: \(label(window))…"
-    updateMenu()
+    updateStatus()
     client.focus(id: id) { [weak self] result in
       guard let self else { return }
+      self.pendingFocusID = nil
       switch result {
       case .success(let focused):
         self.logger.info("focus result=success pid=\(focused.pid) number=\(self.registrationNumbers[id] ?? 0) windows=\(self.client.windows.count)")
@@ -152,7 +176,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         self.logger.error("focus result=failure pid=\(window.pid) number=\(self.registrationNumbers[id] ?? 0) reason=\(error.localizedDescription, privacy: .public) windows=\(self.client.windows.count)")
         self.status = error.localizedDescription
       }
-      self.updateMenu()
+      self.updateStatus()
     }
   }
 
@@ -161,7 +185,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     guard trusted else {
       logger.error("command rejected reason=accessibility_denied windows=\(self.client.windows.count)")
       status = "Allow InfiniteDesk in Privacy & Security → Accessibility."
-      updateMenu()
+      updateStatus()
       return false
     }
     return true
@@ -173,13 +197,29 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   private func label(_ window: DesktopWindow) -> String {
     let number = registrationNumbers[window.id] ?? 0
-    return "\(number). \(window.appName) — \(window.title.isEmpty ? "Untitled window" : window.title)"
+    let frame = window.worldFrame
+    let geometry = String(format: "%.0f, %.0f · %.0f×%.0f", frame.minX, frame.minY, frame.width, frame.height)
+    let availability: String
+    switch window.availability {
+    case .available: availability = ""
+    case .unavailable: availability = " · unavailable (last known bounds)"
+    case .closed: availability = " · closed (last known bounds)"
+    }
+    return "\(number). \(window.appName) — \(window.title.isEmpty ? "Untitled window" : window.title) · \(geometry)\(availability)"
   }
 
-  private func updateMenu() {
+  private func updateStatus() {
+    statusItem?.button?.toolTip = "InfiniteDesk — \(status)"
+  }
+
+  private func rebuildMenu() {
     menu.removeAllItems()
     append("InfiniteDesk · \(client.windows.count) registered", enabled: false)
     append(trusted ? "Accessibility: enabled" : "Accessibility: permission required", enabled: false)
+    if let observationStatus = client.observationStatus {
+      let observationItem = append(observationStatus, enabled: false)
+      observationItem.toolTip = observationStatus
+    }
     let messageItem = append(status, enabled: false)
     messageItem.toolTip = status
     if let shortcutWarning {
@@ -198,10 +238,11 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
       append("No registered windows", enabled: false)
     } else {
       for window in client.windows {
-        let item = append(label(window), action: #selector(selectFromMenu(_:)), enabled: trusted)
+        let item = append(label(window), action: #selector(selectFromMenu(_:)), enabled: trusted && window.availability != .closed)
         item.representedObject = window.id.uuidString
-        item.state = selectedID == window.id ? .on : .off
-        item.toolTip = "PID \(window.pid) · \(window.originalFrame)"
+        item.state = client.focusedID == window.id ? .on : .off
+        item.toolTip = "PID \(window.pid) · Current AX bounds: \(window.worldFrame)"
+          + (window.observationDetail.map { " · \($0)" } ?? "")
       }
       let forgetItem = append("Forget registered window")
       let forgetMenu = NSMenu(title: "Forget registered window")
@@ -220,7 +261,6 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     append("Retry global shortcuts", action: #selector(retryShortcuts))
     menu.addItem(.separator())
     append("Quit InfiniteDesk", action: #selector(quit))
-    statusItem?.button?.toolTip = "InfiniteDesk — \(status)"
   }
 
   @discardableResult
@@ -260,10 +300,11 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let removedLabel = label(window)
     client.remove(id: id)
     cycleCursorID = nil
+    pendingFocusID = nil
     if selectedID == id { selectedID = nil }
     registrationNumbers.removeValue(forKey: id)
     status = "Forgot: \(removedLabel)"
-    updateMenu()
+    updateStatus()
   }
   @objc private func requestPermission() {
     DesktopWindowClient.requestAccessibility()
@@ -273,12 +314,12 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
     if !NSWorkspace.shared.open(url) {
       status = "Open System Settings → Privacy & Security → Accessibility."
-      updateMenu()
+      updateStatus()
     }
   }
   @objc private func retryShortcuts() {
     shortcutWarning = hotkeys?.start()
-    updateMenu()
+    updateStatus()
   }
   @objc private func quit() { NSApp.terminate(nil) }
 }

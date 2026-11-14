@@ -24,7 +24,10 @@ struct DesktopApplicationSnapshot: Sendable {
   let processIdentity: DesktopProcessIdentity
 }
 
-struct DesktopWindow: Identifiable, Sendable {
+enum DesktopWindowAvailability: String, Sendable { case available, unavailable, closed }
+enum DesktopObservationStatus: String, Sendable { case pending, observing, partial, unsupported, paused }
+
+struct DesktopWindow: Identifiable, Equatable, Sendable {
   let id: UUID
   let pid: pid_t
   let appName: String
@@ -32,6 +35,30 @@ struct DesktopWindow: Identifiable, Sendable {
   let originalFrame: CGRect
   let launchDate: Date?
   let processIdentity: DesktopProcessIdentity
+  var worldFrame: CGRect
+  var availability = DesktopWindowAvailability.available
+  var observationStatus = DesktopObservationStatus.pending
+  var observationDetail: String?
+
+  init(
+    id: UUID, pid: pid_t, appName: String, title: String, originalFrame: CGRect,
+    launchDate: Date?, processIdentity: DesktopProcessIdentity
+  ) {
+    self.id = id
+    self.pid = pid
+    self.appName = appName
+    self.title = title
+    self.originalFrame = originalFrame
+    self.launchDate = launchDate
+    self.processIdentity = processIdentity
+    worldFrame = originalFrame
+  }
+}
+
+struct DesktopBackendState: Sendable {
+  let revision: UInt64
+  let windows: [DesktopWindow]
+  let focusedID: UUID?
 }
 
 func desktopLaunchDatesCompatible(expected: Date?, actual: Date?) -> Bool {
@@ -120,7 +147,7 @@ private struct DesktopWindowRecord {
   let application: DesktopApplicationSnapshot
   let app: AXUIElement
   let window: AXUIElement
-  let snapshot: DesktopWindow
+  var snapshot: DesktopWindow
 }
 
 // All access to records and AX handles is confined to queue. Only DTOs cross its boundary.
@@ -129,15 +156,36 @@ final class DesktopWindowBackend: @unchecked Sendable {
   private let access: any DesktopAXAccess
   private let processIdentity: @Sendable (pid_t) -> DesktopProcessIdentity?
   private var records: [UUID: DesktopWindowRecord] = [:]
+  private var closedWindows: [UUID: DesktopWindow] = [:]
   private var pendingRegistrations: [UUID: DesktopOperation] = [:]
+  private let observationProvider: any DesktopObservationProvider
+  private let permissionCheck: @Sendable () -> Bool
+  private var observers: [pid_t: DesktopObserverSession] = [:]
+  private var registrationOrder: [UUID] = []
+  private var trusted = true
+  private var frontmostPID: pid_t?
+  private var currentFocusedID: UUID?
+  private var revision: UInt64 = 0
+  private var lastPublishedWindows: [DesktopWindow] = []
+  private var lastPublishedFocus: UUID?
+  private var updateHandler: (@Sendable (DesktopBackendState) -> Void)?
+  private var setupPending: [UUID] = []
+  private var setupScheduled = false
+  private lazy var observationInbox = DesktopObservationInbox(queue: queue) { [weak self] events in
+    self?.receiveObservations(events)
+  }
 
   init(
     access: any DesktopAXAccess = SystemDesktopAXAccess(),
+    observationProvider: any DesktopObservationProvider = SystemDesktopObservationProvider(),
+    permissionCheck: @escaping @Sendable () -> Bool = { AXIsProcessTrusted() },
     processIdentity: @escaping @Sendable (pid_t) -> DesktopProcessIdentity? = {
       DesktopProcessIdentity.read(pid: $0)
     }
   ) {
     self.access = access
+    self.observationProvider = observationProvider
+    self.permissionCheck = permissionCheck
     self.processIdentity = processIdentity
   }
 
@@ -185,7 +233,7 @@ final class DesktopWindowBackend: @unchecked Sendable {
       try read(record.window, kAXMinimizedAttribute, operation) as? Bool == false,
       try read(record.window, "AXFullScreen", operation) as? Bool == false,
       let windows = try read(record.app, kAXWindowsAttribute, operation) as? [AXUIElement],
-      windows.count <= 256, windows.contains(where: { CFEqual($0, record.window) })
+      windows.contains(where: { CFEqual($0, record.window) })
     else {
       throw DesktopWindowError.message(
         "The exact registered window is unavailable, minimized, or fullscreen. Register it again.")
@@ -293,16 +341,32 @@ final class DesktopWindowBackend: @unchecked Sendable {
         try validateWindow(record, operation)
         if let current = try read(record.app, kAXFocusedWindowAttribute, operation),
           CFEqual(current, record.window)
-        { return record.snapshot }
+        {
+          updateGeometry(id: id, frame: try frame(record.window, operation))
+          if frontmostPID == record.application.pid { currentFocusedID = id }
+          publish()
+          return records[id]?.snapshot ?? record.snapshot
+        }
       }
       Thread.sleep(forTimeInterval: 0.04)
     }
     throw DesktopWindowError.focusUnconfirmed
   }
 
-  func commit(id: UUID, operation: DesktopOperation) {
-    guard pendingRegistrations[id] === operation else { return }
-    pendingRegistrations.removeValue(forKey: id)
+  @discardableResult
+  func commit(id: UUID, operation: DesktopOperation) throws -> DesktopWindow {
+    try operation.check()
+    guard let record = records[id] else {
+      throw DesktopWindowError.message("This window is no longer registered.")
+    }
+    if pendingRegistrations[id] === operation {
+      pendingRegistrations.removeValue(forKey: id)
+      registrationOrder.append(id)
+      scheduleObservation(id: id)
+      if frontmostPID == record.application.pid { currentFocusedID = id }
+      publish()
+    }
+    return record.snapshot
   }
 
   func discardPending() {
@@ -311,24 +375,101 @@ final class DesktopWindowBackend: @unchecked Sendable {
   }
 
   func remove(id: UUID) {
+    detachObservation(id: id)
     records.removeValue(forKey: id)
+    closedWindows.removeValue(forKey: id)
     pendingRegistrations.removeValue(forKey: id)
+    registrationOrder.removeAll { $0 == id }
+    setupPending.removeAll { $0 == id }
+    if currentFocusedID == id { currentFocusedID = nil }
+    publish()
   }
+
   func removeAll() {
+    for session in observers.values { session.handle.cancel() }
+    observers.removeAll()
+    observationInbox.clear()
+    setupPending.removeAll()
     records.removeAll()
+    closedWindows.removeAll()
     pendingRegistrations.removeAll()
+    registrationOrder.removeAll()
+    currentFocusedID = nil
+    publish()
   }
+
 }
 
 @MainActor
 final class DesktopWindowClient {
-  private let backend = DesktopWindowBackend()
+  private let backend: DesktopWindowBackend
   private var operation: DesktopOperation?
   private var timeout: DispatchWorkItem?
   private var applications: [UUID: DesktopApplicationSnapshot] = [:]
   private static let snapshotLogger = Logger(subsystem: "dev.infinitedesk.desktop", category: "snapshot")
   private var closed = false
   private(set) var windows: [DesktopWindow] = []
+  private(set) var focusedID: UUID?
+  var onChange: (@MainActor @Sendable () -> Void)?
+  private var lastRevision: UInt64 = 0
+  private var workspaceTokens: [NSObjectProtocol] = []
+
+  var observationStatus: String? {
+    guard let window = windows.first(where: {
+      $0.availability != .closed && $0.observationStatus != .observing
+    }) else { return nil }
+    return window.observationDetail ?? "Accessibility notifications: \(window.observationStatus.rawValue)."
+  }
+
+  init(backend: DesktopWindowBackend = DesktopWindowBackend()) {
+    self.backend = backend
+    let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    let trusted = Self.accessibilityTrusted
+    backend.queue.async { [weak self] in
+      backend.setUpdateHandler { [weak self] state in
+        DispatchQueue.main.async { [weak self] in self?.apply(state) }
+      }
+      backend.setPermission(trusted)
+      backend.setFrontmost(pid: pid)
+    }
+    let center = NSWorkspace.shared.notificationCenter
+    workspaceTokens.append(center.addObserver(
+      forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+    ) { [weak self] notification in
+      let pid = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+      MainActor.assumeIsolated {
+        guard let self, !self.closed else { return }
+        let backend = self.backend
+        backend.queue.async { backend.setFrontmost(pid: pid) }
+      }
+    })
+    workspaceTokens.append(center.addObserver(
+      forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main
+    ) { [weak self] notification in
+      guard let pid = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
+      else { return }
+      MainActor.assumeIsolated {
+        guard let self, !self.closed else { return }
+        let backend = self.backend
+        backend.queue.async { backend.processTerminated(pid: pid) }
+      }
+    })
+  }
+
+  private func apply(_ state: DesktopBackendState) {
+    guard !closed, state.revision > lastRevision else { return }
+    lastRevision = state.revision
+    windows = state.windows
+    focusedID = state.focusedID
+    onChange?()
+  }
+
+  func setAccessibilityTrusted(_ trusted: Bool) {
+    guard !closed else { return }
+    if !trusted { cancel() }
+    let backend = backend
+    backend.queue.async { backend.setPermission(trusted) }
+  }
 
   static var accessibilityTrusted: Bool { AXIsProcessTrusted() }
 
@@ -374,7 +515,9 @@ final class DesktopWindowClient {
       completion(.failure(.message("The desktop manager has stopped.")))
       return nil
     }
-    guard Self.accessibilityTrusted else {
+    let trusted = Self.accessibilityTrusted
+    setAccessibilityTrusted(trusted)
+    guard trusted else {
       completion(.failure(.message("Allow InfiniteDesk in System Settings → Privacy & Security → Accessibility.")))
       return nil
     }
@@ -437,9 +580,16 @@ final class DesktopWindowClient {
           }
           do {
             try operation.check()
-            backend.queue.async { backend.commit(id: window.id, operation: operation) }
-            if !self.windows.contains(where: { $0.id == window.id }) { self.windows.append(window) }
-            self.applications[window.id] = application
+            backend.queue.async { [weak self] in
+              let committed = Result { try backend.commit(id: window.id, operation: operation) }
+                .mapError { ($0 as? DesktopWindowError) ?? .message($0.localizedDescription) }
+              DispatchQueue.main.async { [weak self] in
+                guard let self, self.operation === operation else { return }
+                if case .success = committed { self.applications[window.id] = application }
+                self.finish(operation: operation, result: committed, completion: completion)
+              }
+            }
+            return
           } catch {
             backend.queue.async { backend.discardPending() }
             final = .failure(.message("Window registration timed out."))
@@ -544,7 +694,6 @@ final class DesktopWindowClient {
 
   func remove(id: UUID) {
     cancel()
-    windows.removeAll { $0.id == id }
     applications.removeValue(forKey: id)
     let backend = backend
     backend.queue.async { backend.remove(id: id) }
@@ -553,9 +702,296 @@ final class DesktopWindowClient {
   func close() {
     cancel()
     closed = true
+    for token in workspaceTokens { NSWorkspace.shared.notificationCenter.removeObserver(token) }
+    workspaceTokens.removeAll()
     windows.removeAll()
+    focusedID = nil
     applications.removeAll()
+    onChange?()
+    onChange = nil
     let backend = backend
     backend.queue.async { backend.removeAll() }
+  }
+}
+
+private final class DesktopObserverSession {
+  let id = UUID()
+  let application: DesktopApplicationSnapshot
+  let app: AXUIElement
+  let handle: any DesktopAXObserverHandle
+  var focusStatus = AXError.failure
+  var windowIDs: Set<UUID> = []
+
+  init(record: DesktopWindowRecord, handle: any DesktopAXObserverHandle) {
+    application = record.application
+    app = record.app
+    self.handle = handle
+  }
+}
+
+extension DesktopWindowBackend {
+  func setUpdateHandler(_ handler: @escaping @Sendable (DesktopBackendState) -> Void) {
+    updateHandler = handler
+  }
+
+  func state() -> DesktopBackendState {
+    DesktopBackendState(
+      revision: revision,
+      windows: registrationOrder.compactMap { records[$0]?.snapshot ?? closedWindows[$0] },
+      focusedID: currentFocusedID)
+  }
+
+  private func publish() {
+    let windows = registrationOrder.compactMap { records[$0]?.snapshot ?? closedWindows[$0] }
+    guard windows != lastPublishedWindows || currentFocusedID != lastPublishedFocus else { return }
+    revision += 1
+    lastPublishedWindows = windows
+    lastPublishedFocus = currentFocusedID
+    updateHandler?(DesktopBackendState(revision: revision, windows: windows, focusedID: currentFocusedID))
+  }
+
+  func setPermission(_ allowed: Bool) {
+    guard trusted != allowed else { return }
+    trusted = allowed
+    if !allowed {
+      for session in observers.values { session.handle.cancel() }
+      observers.removeAll()
+      observationInbox.clear()
+      setupPending.removeAll()
+      currentFocusedID = nil
+      for id in registrationOrder where records[id] != nil {
+        records[id]?.snapshot.observationStatus = .paused
+        records[id]?.snapshot.observationDetail = "Accessibility permission is required."
+        records[id]?.snapshot.availability = .unavailable
+      }
+      publish()
+    } else {
+      for id in registrationOrder where records[id] != nil {
+        records[id]?.snapshot.observationStatus = .pending
+        records[id]?.snapshot.observationDetail = nil
+        scheduleObservation(id: id)
+      }
+      publish()
+    }
+  }
+
+  func setFrontmost(pid: pid_t?) {
+    setPermission(permissionCheck())
+    frontmostPID = pid
+    currentFocusedID = nil
+    if let pid, let session = observers[pid] {
+      observationInbox.submit(.init(session: session.id, windowID: nil, kind: .focus))
+    }
+    publish()
+  }
+
+  func processTerminated(pid: pid_t) {
+    // A delayed workspace termination for an older incarnation cannot close a recycled PID's windows.
+    let live = processIdentity(pid)
+    let ids = registrationOrder.filter {
+      guard let record = records[$0] else { return false }
+      return record.application.pid == pid && record.application.processIdentity != live
+    }
+    for id in ids { markClosed(id: id) }
+    publish()
+  }
+
+  private func scheduleObservation(id: UUID) {
+    guard trusted, !setupPending.contains(id) else { return }
+    setupPending.append(id)
+    guard !setupScheduled else { return }
+    setupScheduled = true
+    queue.async { [weak self] in self?.setupNextObservation() }
+  }
+
+  private func setupNextObservation() {
+    guard !setupPending.isEmpty else {
+      setupScheduled = false
+      return
+    }
+    let id = setupPending.removeFirst()
+    installObservation(id: id)
+    if setupPending.isEmpty {
+      setupScheduled = false
+    } else {
+      queue.asyncAfter(deadline: .now() + .milliseconds(1)) { [weak self] in self?.setupNextObservation() }
+    }
+  }
+
+  private func installObservation(id: UUID) {
+    if trusted && !permissionCheck() { setPermission(false) }
+    guard trusted, let record = records[id], pendingRegistrations[id] == nil,
+      record.snapshot.availability != .closed
+    else { return }
+    guard processIdentity(record.application.pid) == record.application.processIdentity else {
+      markClosed(id: id)
+      publish()
+      return
+    }
+    let operation = DesktopOperation(timeout: 1)
+    do {
+      let session: DesktopObserverSession
+      if let existing = observers[record.application.pid],
+        existing.application.processIdentity == record.application.processIdentity
+      {
+        session = existing
+      } else {
+        if let old = observers.removeValue(forKey: record.application.pid) {
+          observationInbox.discard(session: old.id)
+          old.handle.cancel()
+        }
+        let inbox = observationInbox
+        let handle = try observationProvider.create(pid: record.application.pid) { event in inbox.submit(event) }
+        session = DesktopObserverSession(record: record, handle: handle)
+        observers[record.application.pid] = session
+        try operation.check()
+        session.focusStatus = handle.subscribe(
+          record.app, notification: kAXFocusedWindowChangedNotification,
+          event: .init(session: session.id, windowID: nil, kind: .focus))
+      }
+      guard !session.windowIDs.contains(id) else { return }
+      session.windowIDs.insert(id)
+      var statuses: [(String, AXError)] = [(kAXFocusedWindowChangedNotification, session.focusStatus)]
+      for (notification, kind) in [
+        (kAXMovedNotification, DesktopObservationEvent.Kind.geometry),
+        (kAXResizedNotification, .geometry),
+        (kAXUIElementDestroyedNotification, .destroyed),
+      ] {
+        try operation.check()
+        let status = session.handle.subscribe(
+          record.window, notification: notification,
+          event: .init(session: session.id, windowID: id, kind: kind))
+        statuses.append((notification, status))
+      }
+      try operation.check()
+      let failures = statuses.filter { $0.1 != .success }
+      records[id]?.snapshot.observationStatus = failures.isEmpty ? .observing
+        : failures.count == statuses.count ? .unsupported : .partial
+      records[id]?.snapshot.observationDetail = failures.isEmpty ? nil : "Unavailable notifications: "
+        + failures.map { "\($0.0) (AX \($0.1.rawValue))" }.joined(separator: ", ")
+      // One event-driven readback closes the registration/subscribe gap; there is no timer polling.
+      observationInbox.submit(.init(session: session.id, windowID: id, kind: .geometry))
+      observationInbox.submit(.init(session: session.id, windowID: nil, kind: .focus))
+    } catch {
+      if let session = observers[record.application.pid], session.windowIDs.isEmpty {
+        observers.removeValue(forKey: record.application.pid)
+        observationInbox.discard(session: session.id)
+        session.handle.cancel()
+      } else {
+        detachObservation(id: id)
+      }
+      records[id]?.snapshot.observationStatus = .unsupported
+      records[id]?.snapshot.observationDetail = error.localizedDescription
+    }
+    publish()
+  }
+
+  private func detachObservation(id: UUID) {
+    guard let record = records[id], let session = observers[record.application.pid],
+      session.windowIDs.remove(id) != nil
+    else { return }
+    observationInbox.discard(session: session.id, windowID: id)
+    if session.windowIDs.isEmpty {
+      observationInbox.discard(session: session.id)
+      observers.removeValue(forKey: record.application.pid)
+      session.handle.cancel()
+    } else if !session.handle.unsubscribe(windowID: id) {
+      // A failed unsubscribe leaves an uncertain server-side registration. Retire the observer
+      // before resubscribing surviving exact handles, so stale refcons can never be reused.
+      observers.removeValue(forKey: record.application.pid)
+      observationInbox.discard(session: session.id)
+      session.handle.cancel()
+      for survivor in session.windowIDs { scheduleObservation(id: survivor) }
+    }
+  }
+
+  private func markClosed(id: UUID) {
+    guard var snapshot = records[id]?.snapshot else { return }
+    detachObservation(id: id)
+    records.removeValue(forKey: id)
+    pendingRegistrations.removeValue(forKey: id)
+    snapshot.availability = .closed
+    snapshot.observationStatus = .paused
+    snapshot.observationDetail = "The registered window closed."
+    closedWindows[id] = snapshot
+    setupPending.removeAll { $0 == id }
+    if currentFocusedID == id { currentFocusedID = nil }
+  }
+
+  private func updateGeometry(id: UUID, frame: CGRect) {
+    guard records[id]?.snapshot.availability != .closed else { return }
+    records[id]?.snapshot.worldFrame = frame
+    records[id]?.snapshot.availability = .available
+  }
+
+  private func refreshGeometry(id: UUID, operation: DesktopOperation) -> Bool {
+    guard let record = records[id] else { return true }
+    do {
+      try validateProcess(record.application, operation)
+      guard access.pid(record.window) == record.application.pid,
+        try read(record.window, kAXRoleAttribute, operation) as? String == kAXWindowRole
+      else { throw DesktopWindowError.message("The registered window is temporarily inaccessible.") }
+      let current = try frame(record.window, operation)
+      try validateProcess(record.application, operation)
+      updateGeometry(id: id, frame: current)
+      return true
+    } catch {
+      if processIdentity(record.application.pid) != record.application.processIdentity {
+        markClosed(id: id)
+        return true
+      }
+      records[id]?.snapshot.availability = .unavailable
+      return false
+    }
+  }
+
+  private func refreshFocus(_ session: DesktopObserverSession, operation: DesktopOperation) -> Bool {
+    guard frontmostPID == session.application.pid else { return true }
+    currentFocusedID = nil
+    do {
+      try validateProcess(session.application, operation)
+      guard let focused = try read(session.app, kAXFocusedWindowAttribute, operation),
+        CFGetTypeID(focused) == AXUIElementGetTypeID()
+      else { return false }
+      currentFocusedID = session.windowIDs.first { id in
+        guard let record = records[id], record.snapshot.availability != .closed else { return false }
+        return CFEqual(record.window, focused)
+      }
+      return true
+    } catch { return false }
+  }
+
+  private func receiveObservations(_ events: [DesktopObservationEvent]) {
+    guard trusted else { return }
+    guard permissionCheck() else {
+      setPermission(false)
+      return
+    }
+    for event in events {
+      guard let session = observers.values.first(where: { $0.id == event.session }) else { continue }
+      guard processIdentity(session.application.pid) == session.application.processIdentity else {
+        for id in Array(session.windowIDs) { markClosed(id: id) }
+        continue
+      }
+      if event.kind == .destroyed, let id = event.windowID, session.windowIDs.contains(id) {
+        markClosed(id: id)
+        continue
+      }
+      let operation = DesktopOperation(timeout: 0.8)
+      switch event.kind {
+      case .focus, .focusRetry:
+        if !refreshFocus(session, operation: operation), event.kind == .focus {
+          observationInbox.submit(.init(session: session.id, windowID: nil, kind: .focusRetry))
+        }
+      case .geometry, .geometryRetry:
+        if let id = event.windowID, session.windowIDs.contains(id),
+          !refreshGeometry(id: id, operation: operation), event.kind == .geometry
+        {
+          observationInbox.submit(.init(session: session.id, windowID: id, kind: .geometryRetry))
+        }
+      case .destroyed: break
+      }
+    }
+    publish()
   }
 }

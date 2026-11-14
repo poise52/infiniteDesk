@@ -18,7 +18,8 @@ Open the InfiniteDesk icon in the menu bar and grant Accessibility access when r
 
 1. Focus a window and press **⌃⌥⌘W** to register it. Repeat with a second window.
 2. Press **⌃⌥⌘←** or **⌃⌥⌘→** to focus the previous or next registered window. Type directly in the original application.
-3. To choose a specific registration, use the InfiniteDesk menu. The menu also shows the latest operation and any shortcut conflicts.
+3. Drag a registered window by its title bar, or resize it by an edge. Release the mouse and open the InfiniteDesk menu. The window's row shows its current position and size in macOS points. At the current 1:1 scale, these are also its coordinates on the workspace.
+4. A checkmark identifies the focused registered window. Choose a row to focus that window. A closed window keeps its last known bounds until you forget it. The menu reports when an application cannot send the notifications used for tracking.
 
 Run the desktop checks without opening windows or granting Accessibility access:
 

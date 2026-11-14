@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-[ "$#" -ge 1 ] || { echo 'Usage: driver-command.sh preflight | snapshot PID | focus PID WINDOW | shortcut PID WINDOW COMMAND | type PID WINDOW TOKEN' >&2; exit 2; }
+[ "$#" -ge 1 ] || { echo 'Usage: driver-command.sh preflight | finder-snapshot | snapshot PID | focus PID WINDOW | shortcut PID WINDOW COMMAND | type PID WINDOW TOKEN | gesture PID WINDOW JSON' >&2; exit 2; }
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../../../.." && pwd)
 bundle="$root/target/desktop-acceptance/InfiniteDesk Acceptance.app"

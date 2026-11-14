@@ -3,8 +3,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import { access, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { bindOriginals, insideWorkArea, planOriginals, planRapidDrags, PostReleaseGeometryGuard, validateState, verifyDestroyed, verifyGestureMotion, verifyModel } from './geometry.mjs';
 
 const driver = process.argv[2];
 if (!driver || typeof WebSocket === 'undefined') {
@@ -12,6 +13,11 @@ if (!driver || typeof WebSocket === 'undefined') {
 }
 const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const here = dirname(fileURLToPath(import.meta.url));
+const statePath = process.env.INFINITEDESK_TEST_STATE_PATH;
+if (statePath !== undefined) assert(isAbsolute(statePath), 'INFINITEDESK_TEST_STATE_PATH must be an explicit absolute path');
+const geometryCases = ['Original model geometry', 'External titlebar click focuses B', 'Fast titlebar drag B',
+  'Real corner resize B', 'Second titlebar drag B', 'Rapid consecutive titlebar drags B', 'Chrome minimum-size constraint', 'Destroyed B model state',
+  'Replacement is not automatically registered'];
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const caseNames = [
   'Original A/B setup input', 'A/B/A: first A', 'A/B/A: B', 'A/B/A: final A',
@@ -21,7 +27,13 @@ const caseNames = [
 function native(...args) {
   const result = spawnSync(driver, args.map(String), { encoding: 'utf8', timeout: 15_000 });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(result.stdout.trim() || result.stderr.trim());
+  if (result.status !== 0) {
+    let payload;
+    try { payload = JSON.parse(result.stdout); } catch { /* Transport failures have stderr only. */ }
+    const error = new Error(payload?.reason ?? (result.stdout.trim() || result.stderr.trim()));
+    if (payload) error.driverResult = payload;
+    throw error;
+  }
   return JSON.parse(result.stdout);
 }
 const check = spawnSync(driver, ['preflight'], { encoding: 'utf8', timeout: 15_000 });
@@ -35,6 +47,7 @@ if (check.status === 77) {
     fixturesLaunched: false, managerActionsSent: false,
     cases: Object.fromEntries(caseNames.map(name => [name, 'NOT_RUN'])),
     unverified: ['All live focus, registration, typing, same-title and closed-target cases; fixture launch was skipped'],
+    geometry: { status: statePath ? 'SKIP' : 'NOT_REQUESTED', cases: Object.fromEntries(geometryCases.map(name => [name, 'NOT_RUN'])) },
   }, null, 2));
   console.log(`SKIP evidence: ${skippedReport}`);
   process.exit(77);
@@ -100,6 +113,9 @@ const report = {
   nativeFocusCases: Object.fromEntries(caseNames.slice(1).map(name => [name, 'NOT_RUN'])),
   nativeFocusStatus: 'NOT_RUN',
   inputStatus: 'NOT_RUN',
+  geometry: { status: statePath ? 'NOT_RUN' : 'NOT_REQUESTED', statePath: statePath ?? null,
+    cases: Object.fromEntries(geometryCases.map(name => [name, 'NOT_RUN'])), evidence: [],
+    finder: { status: 'NOT_RUN' }, constraint: { status: 'NOT_RUN' } },
   cases: Object.fromEntries(caseNames.map(name => [name, 'NOT_RUN'])),
   unverified: [
     'Delayed stale completion: not injected into the production app; consult backend test results separately',
@@ -120,6 +136,7 @@ const cdp = new CDP();
 const targets = {};
 let pid;
 let browserIdentityVerified = false;
+let geometryContext;
 
 async function eventually(description, operation, predicate, timeout = 5_000) {
   const deadline = Date.now() + timeout;
@@ -182,7 +199,21 @@ async function evidence() {
     try { result.dom[name] = await values(name); }
     catch (error) { result.dom[name] = { error: String(error) }; }
   }
+  if (statePath) {
+    try { result.model = await readModel(); } catch (error) { result.modelError = String(error); }
+  }
   return result;
+}
+async function readModel() {
+  assert(statePath, 'Geometry cases require INFINITEDESK_TEST_STATE_PATH');
+  return validateState(JSON.parse(await readFile(statePath, 'utf8')));
+}
+async function fixtureShortcut(windowID, command) {
+  if (statePath) {
+    const state = await readModel();
+    assert(state.windows.every(window => window.pid === pid), 'Refusing shortcuts while unrelated windows are registered');
+  }
+  return native('shortcut', pid, windowID, command);
 }
 async function saveReport() {
   await writeFile(join(directory, 'report.json'), JSON.stringify(report, null, 2));
@@ -208,6 +239,7 @@ async function typeToken(label, name, id, suffix) {
     }, value => value.target === attempt.expected);
   } catch (error) {
     attempt.error = error.stack ?? String(error);
+    if (error.driverResult) attempt.driverFailure = error.driverResult;
   }
   attempt.after = await evidence();
   try {
@@ -258,7 +290,178 @@ async function nativeCheckpoint(label, baseline, expectedID) {
   await saveReport();
 }
 
+function finderUnchanged(current) {
+  for (const window of geometryContext.finder) {
+    const actual = current.windows.find(item => item.pid === window.pid && item.id === window.id);
+    if (!actual || !sameFrame(actual.frame, window.frame)) {
+      report.geometry.finder.status = 'FAIL';
+      throw new Error(`Existing Finder CG window ${window.id} changed or disappeared`);
+    }
+  }
+}
+async function settleGeometry(focusedName, samples, allowFocusTransition, released) {
+  const deadline = Date.now() + 10_000;
+  let stableSince = Date.now();
+  let previous;
+  const releaseGuard = new PostReleaseGeometryGuard(released.frame, released.observedAt, released.releasedAt);
+  do {
+    const actual = snapshot();
+    const sample = { at: new Date().toISOString(), native: actual };
+    samples.push(sample);
+    const originals = geometryContext.originals;
+    unchanged(actual, [originals.A]);
+    assert.equal(actual.frontmostPID, pid, 'Gesture changed the foreground application');
+    assert.equal(actual.focusedID, originals[focusedName].id, 'Gesture lost the expected native window focus');
+    const b = actual.windows.find(window => window.id === originals.B.id);
+    assert(b, 'Gesture lost original B CG identity');
+    const finder = native('finder-snapshot');
+    sample.finder = finder;
+    finderUnchanged(finder);
+    sample.releaseAnchor = releaseGuard.observe(b.frame, Date.now());
+    try { sample.model = await readModel(); }
+    catch (error) { sample.modelError = String(error); }
+    if (sample.model) {
+      bindOriginals(sample.model, pid, originals, geometryContext.binding);
+      if (!allowFocusTransition) {
+        assert.equal(sample.model.focusedID, geometryContext.binding[focusedName], 'A move/resize changed the already confirmed model focusedID');
+      }
+      try { verifyModel(sample.model, pid, originals, geometryContext.binding, actual, focusedName); }
+      catch (error) { sample.modelError = String(error); }
+    }
+    if (!previous || !sameFrame(previous, b.frame)) stableSince = Date.now();
+    previous = b.frame;
+    if (!sample.modelError && samples.length >= 3 && Date.now() - stableSince >= 1_000
+      && sample.releaseAnchor && Date.now() - sample.releaseAnchor.at >= 750) {
+      return { samples, final: sample, b };
+    }
+    await pause(75);
+  } while (Date.now() < deadline);
+  throw new Error(`Native/model geometry did not settle: ${JSON.stringify(samples.at(-1))}`);
+}
+async function geometryGesture(label, kind, dx, dy, durationMS, constraint = false, segments) {
+  report.geometry.cases[label] = 'RUNNING';
+  const record = { label, kind, dx, dy, before: await evidence() };
+  report.geometry.evidence.push(record);
+  try {
+    const before = requireNative(record.before);
+    const window = before.windows.find(item => item.id === geometryContext.originals.B.id);
+    assert(window, 'Original B is missing before gesture');
+    unchanged(before, [geometryContext.originals.A]);
+    record.requestedFrame = kind === 'resize'
+      ? { ...window.frame, width: window.frame.width + dx, height: window.frame.height + dy }
+      : { ...window.frame, x: window.frame.x + dx, y: window.frame.y + dy };
+    if (kind === 'click') record.requestedFrame = { ...window.frame };
+    assert(insideWorkArea(record.requestedFrame, report.geometry.workArea, 16), 'Requested gesture frame must remain inside the work area');
+    record.drivers = [];
+    record.segmentEvidence = [];
+    let expectedFrame = { ...window.frame };
+    for (const segment of segments ?? [{ dx, dy, durationMS }]) {
+      const requested = kind === 'resize'
+        ? { ...expectedFrame, width: expectedFrame.width + segment.dx, height: expectedFrame.height + segment.dy }
+        : { ...expectedFrame, x: expectedFrame.x + segment.dx, y: expectedFrame.y + segment.dy };
+      assert(insideWorkArea(requested, report.geometry.workArea, 16), 'Intermediate mouse path must keep the whole window in the work area');
+      const receipt = native('gesture', pid, window.id, JSON.stringify({ kind, ...segment, expectedFrame }));
+      record.drivers.push(receipt);
+      const actual = snapshot();
+      unchanged(actual, [geometryContext.originals.A]);
+      assert.equal(actual.frontmostPID, pid);
+      assert.equal(actual.focusedID, window.id);
+      const moved = actual.windows.find(item => item.id === window.id);
+      assert(moved, 'Real gesture lost the original native window');
+      record.segmentEvidence.push({ beforeFrame: expectedFrame, requestedFrame: requested, nativeAfter: actual,
+        at: new Date().toISOString(), driver: receipt });
+      assert(insideWorkArea(moved.frame, report.geometry.workArea, 16), 'Actual gesture frame left the work area');
+      verifyGestureMotion(kind, expectedFrame, moved.frame, segment.dx, segment.dy, constraint);
+      expectedFrame = { ...moved.frame };
+    }
+    record.settling = [];
+    const finalSegment = record.segmentEvidence.at(-1);
+    record.releaseObservation = { frame: expectedFrame, observedAt: Date.parse(finalSegment.at),
+      releasedAt: record.drivers.at(-1).completedAt * 1000 };
+    const settled = await settleGeometry('B', record.settling, kind === 'click', record.releaseObservation);
+    record.actualFrame = settled.b.frame;
+    geometryContext.latestB = settled.b;
+    verifyGestureMotion(kind, window.frame, record.actualFrame, dx, dy, constraint);
+    const after = await evidence();
+    record.after = after;
+    for (const name of ['A', 'B']) {
+      for (const field of ['target', 'decoy', 'output', 'count']) {
+        assert.equal(after.dom[name]?.[field], record.before.dom[name]?.[field], `Gesture edited ${name} ${field}`);
+      }
+    }
+    if (constraint) {
+      const changed = !sameFrame(window.frame, record.actualFrame);
+      const constrained = record.actualFrame.width > record.requestedFrame.width + 2 || record.actualFrame.height > record.requestedFrame.height + 2;
+      record.status = changed && constrained ? 'PASS' : changed ? 'NOT_OBSERVED' : 'INCONCLUSIVE';
+      report.geometry.constraint = { status: record.status, requestedFrame: record.requestedFrame, actualFrame: record.actualFrame,
+        reason: changed && constrained ? 'Chrome resized but applied its own minimum dimensions; model matched actual AX geometry'
+          : 'A minimum-size constraint was not established by this real-corner gesture' };
+    } else record.status = 'PASS';
+    report.geometry.cases[label] = record.status;
+    console.log(`${record.status}: geometry ${label}`);
+    await saveReport();
+  } catch (error) {
+    record.status = 'FAIL';
+    record.error = error.stack ?? String(error);
+    if (error.driverResult) record.driverFailure = error.driverResult;
+    report.geometry.cases[label] = 'FAIL';
+    report.geometry.status = 'FAIL';
+    throw error;
+  }
+}
+async function stageTwo(originals) {
+  report.geometry.status = 'RUNNING';
+  report.geometry.zOrderSetup = { before: await evidence() };
+  native('focus', pid, originals.B.id);
+  native('focus', pid, originals.A.id);
+  report.geometry.zOrderSetup.after = await evidence();
+  const state = await eventually('Model did not register both original frames', async () => {
+    try {
+      const model = await readModel();
+      const binding = bindOriginals(model, pid, originals);
+      verifyModel(model, pid, originals, binding, snapshot(), 'A');
+      return { model, binding };
+    } catch (error) { return { error: String(error) }; }
+  }, value => Boolean(value.binding));
+  const finder = native('finder-snapshot');
+  geometryContext = { originals, binding: state.binding, finder: finder.windows, latestB: originals.B };
+  report.geometry.binding = state.binding;
+  report.geometry.initialModel = state.model;
+  report.geometry.finder = { status: finder.windows.length ? 'RUNNING' : 'SKIP', baseline: finder.windows,
+    reason: finder.windows.length ? 'Existing Finder window IDs and frames are checked after every gesture' : 'No visible ordinary Finder window existed; Finder was not opened' };
+  report.geometry.cases['Original model geometry'] = 'PASS';
+  const area = report.geometry.workArea;
+  assert(insideWorkArea(originals.A.frame, area, 16) && insideWorkArea(originals.B.frame, area, 16), 'Original native frames must fit the work area');
+  assert(originals.A.frame.y + originals.A.frame.height < originals.B.frame.y, 'A must not obscure the initial B titlebar');
+  const midpoint = area.x + area.width / 2;
+  assert(originals.B.frame.x + originals.B.frame.width / 2 < midpoint, 'B must start in the left half');
+  await geometryGesture('External titlebar click focuses B', 'click', 0, 0, 150);
+  const crossDX = Math.ceil(midpoint) + 24 - geometryContext.latestB.frame.x;
+  assert(Math.abs(crossDX) <= 1000, 'Cross-half drag exceeds the guarded input range');
+  await geometryGesture('Fast titlebar drag B', 'drag', crossDX, 0, 140);
+  assert(geometryContext.latestB.frame.x > midpoint, 'B must reach the right half after the fast drag');
+  const moved = geometryContext.latestB.frame;
+  const resizeDX = Math.min(80, Math.floor(area.x + area.width - moved.x - moved.width - 24));
+  const resizeDY = Math.min(55, Math.floor(area.y + area.height - moved.y - moved.height - 24));
+  assert(resizeDX >= 10 && resizeDY >= 10, 'The work area has insufficient room for the real resize');
+  await geometryGesture('Real corner resize B', 'resize', resizeDX, resizeDY, 300);
+  await geometryGesture('Second titlebar drag B', 'drag', -24, -18, 220);
+  const rapid = planRapidDrags(geometryContext.latestB.frame, originals.A.frame, area);
+  await geometryGesture('Rapid consecutive titlebar drags B', 'drag',
+    rapid.reduce((sum, segment) => sum + segment.dx, 0), rapid.reduce((sum, segment) => sum + segment.dy, 0),
+    150, false, rapid);
+  const current = geometryContext.latestB.frame;
+  await geometryGesture('Chrome minimum-size constraint', 'resize', 160 - current.width, 120 - current.height, 450, true);
+  if (geometryContext.finder.length) report.geometry.finder.status = 'PASS';
+  await saveReport();
+}
+
 try {
+  if (statePath) {
+    const initial = await readModel();
+    report.geometry.initialEmptyModel = initial;
+    assert.equal(initial.windows.length, 0, 'Stage 2 requires an actually empty manager model before any shortcuts');
+  }
   const endpoint = await eventually('Disposable Chrome did not expose DevTools', async () => {
     if (childError) throw childError;
     if (child.exitCode !== null) throw new Error(`Disposable Chrome exited ${child.exitCode}`);
@@ -283,8 +486,22 @@ try {
   browserIdentityVerified = true;
   report.chromePID = pid;
   const initial = await cdp.send('Target.getTargets');
-  await createTarget('A', { left: 72, top: 100, width: 620, height: 470 });
-  await createTarget('B', { left: 360, top: 230, width: 650, height: 490 });
+  if (statePath) {
+    const first = initial.targetInfos.find(target => target.type === 'page');
+    assert(first, 'Expected an owned blank page for work-area discovery');
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: first.targetId, flatten: true });
+    const area = await evaluate({ sessionId }, '({x: screen.availLeft, y: screen.availTop, width: screen.availWidth, height: screen.availHeight})');
+    report.geometry.workArea = area;
+    const plan = planOriginals(area);
+    report.geometry.plannedOriginals = plan;
+    for (const name of ['A', 'B']) {
+      const frame = plan[name];
+      await createTarget(name, { left: frame.x, top: frame.y, width: frame.width, height: frame.height });
+    }
+  } else {
+    await createTarget('A', { left: 72, top: 100, width: 620, height: 470 });
+    await createTarget('B', { left: 360, top: 230, width: 650, height: 490 });
+  }
   for (const target of initial.targetInfos.filter(item => item.type === 'page')) {
     await cdp.send('Target.closeTarget', { targetId: target.targetId });
   }
@@ -303,7 +520,10 @@ try {
       field.setSelectionRange(field.value.length, field.value.length); })()`);
     const inputPassed = await typeToken(`Setup ${name}`, name, window.id, `-original-${name}`);
     setupInputPassed = inputPassed && setupInputPassed;
-    native('shortcut', pid, window.id, 'register');
+    if (statePath && name === 'A') {
+      assert.equal((await readModel()).windows.length, 0, 'Manager gained registrations during setup; refusing the first shortcut');
+    }
+    await fixtureShortcut(window.id, 'register');
     // The production registration has no external completion API. Subsequent
     // focus/DOM assertions fail if the hotkey was not actually registered.
     await pause(500);
@@ -316,7 +536,7 @@ try {
   let selected = b;
   async function cycle(direction, destination, name, token, label, remaining = baseline) {
     report.activeNativeCase = label;
-    native('shortcut', pid, selected.id, direction);
+    await fixtureShortcut(selected.id, direction);
     const state = await eventually(`Expected native focus on original ${name}`, async () => snapshot(),
       value => value.frontmostPID === pid && value.focusedID === destination.id);
     unchanged(state, remaining);
@@ -337,26 +557,45 @@ try {
   await cycle('right', b, 'B', '-same-title-B', 'Identical titles: retained B identity');
   await cycle('left', a, 'A', '-same-title-A', 'Identical titles: retained A identity');
 
+  if (statePath) await stageTwo({ A: a, B: b });
+  const closedBFrame = geometryContext?.latestB.frame ?? b.frame;
+
   await cdp.send('Target.closeTarget', { targetId: targets.B.targetId });
   await eventually('Original B did not close', async () => snapshot(), state => !state.windows.some(item => item.id === b.id));
-  await createTarget('replacement', { left: b.frame.x, top: b.frame.y, width: b.frame.width, height: b.frame.height });
+  if (geometryContext) {
+    const model = await eventually('Destroyed B remained available in the model', async () => {
+      try { const state = await readModel(); verifyDestroyed(state, pid, geometryContext.binding); return { state }; }
+      catch (error) { return { error: String(error) }; }
+    }, value => Boolean(value.state));
+    report.geometry.destroyedModel = model.state;
+    report.geometry.cases['Destroyed B model state'] = 'PASS';
+  }
+  await createTarget('replacement', { left: closedBFrame.x, top: closedBFrame.y, width: closedBFrame.width, height: closedBFrame.height });
   await evaluate(targets.replacement, 'document.title = "InfiniteDesk Identical Title"');
   const replacementState = await eventually('Replacement did not match the closed window frame and shared AX title', async () => snapshot(), state => {
     const originalA = state.windows.find(item => item.id === a.id);
     const next = state.windows.find(item => item.id !== a.id && item.id !== b.id);
-    return state.windows.length === 2 && originalA && next && sameFrame(b.frame, next.frame)
+    return state.windows.length === 2 && originalA && next && sameFrame(closedBFrame, next.frame)
       && originalA.title.startsWith('InfiniteDesk Identical Title') && originalA.title === next.title;
   });
   const replacement = replacementState.windows.find(item => item.id !== a.id);
   assert.notEqual(replacement.id, b.id, 'A reused native window ID makes this negative case inconclusive');
-  assert(sameFrame(b.frame, replacement.frame), 'Replacement must reproduce the original B frame');
+  assert(sameFrame(closedBFrame, replacement.frame), 'Replacement must reproduce the closed B frame');
   assert.equal(replacementState.windows.find(item => item.id === a.id).title, replacement.title,
     'Replacement and original A must have the same AX title');
   report.replacement = replacement;
   native('focus', pid, a.id);
+  if (geometryContext) {
+    const model = await eventually('Unregistered replacement changed model registration/focus', async () => {
+      try { const state = await readModel(); verifyDestroyed(state, pid, geometryContext.binding); return { state }; }
+      catch (error) { return { error: String(error) }; }
+    }, value => Boolean(value.state));
+    report.geometry.replacementModel = model.state;
+    report.geometry.cases['Replacement is not automatically registered'] = 'PASS';
+  }
   selected = a;
   report.activeNativeCase = 'Closed B with identical-title replacement did not retarget input';
-  native('shortcut', pid, a.id, 'right');
+  await fixtureShortcut(a.id, 'right');
   const refusalDeadline = Date.now() + 1_500;
   do {
     const state = snapshot();
@@ -376,12 +615,18 @@ try {
     report.replacementInputFailure = 'The unregistered replacement was edited; native focus result is separate';
   }
   unchanged(snapshot(), [a, replacement]);
+  if (geometryContext) {
+    finderUnchanged(native('finder-snapshot'));
+    verifyDestroyed(await readModel(), pid, geometryContext.binding);
+    report.geometry.status = 'PASS';
+  }
   report.nativeFocusStatus = 'PASS';
   report.inputStatus = Object.values(report.inputCases).every(value => value === 'PASS') && replacementUntouched ? 'PASS' : 'FAIL';
   report.status = report.inputStatus;
   if (report.status === 'FAIL') process.exitCode = 1;
 } catch (error) {
   report.status = 'FAIL';
+  if (statePath && report.geometry.status !== 'PASS') report.geometry.status = 'FAIL';
   report.error = error.stack ?? String(error);
   report.nativeFocusStatus = 'INCOMPLETE';
   if (report.activeNativeCase && report.nativeFocusCases[report.activeNativeCase] !== 'PASS') {

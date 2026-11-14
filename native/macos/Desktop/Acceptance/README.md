@@ -157,3 +157,97 @@ case must be assessed from the backend test results separately. Frame readbacks
 verify unchanged geometry; zero position/size writes are not counted by this
 harness. Consult adapter test results as separate evidence. Finder and Dock ordinary input remain a manual acceptance
 step: record their observed behavior separately, without modifying user files.
+
+## Opt-in stage 2: real desktop geometry
+
+Stage 1 remains the default. Stage 2 runs only when the same explicit absolute
+`INFINITEDESK_TEST_STATE_PATH` is passed to the fresh desktop manager and this
+harness. The manager must have written that JSON snapshot before acceptance
+starts. The harness only reads this path and never creates, edits or removes it.
+For example, from the repository root:
+
+```sh
+state_dir=$(mktemp -d "${TMPDIR:-/tmp}/infinitedesk-stage2.XXXXXXXX")
+state_path="$state_dir/model.json"
+open -n -g --env "INFINITEDESK_TEST_STATE_PATH=$state_path" target/InfiniteDesk.app
+# Wait for the fresh manager to write model.json, then:
+INFINITEDESK_TEST_STATE_PATH="$state_path" native/macos/Desktop/Acceptance/run.sh --run
+```
+
+The snapshot contract is `{windows:[{id,pid,title,originalFrame,worldFrame,availability}],focusedID?}`.
+IDs are model UUIDs; frames use global AX coordinates in points; availability
+is `available`, `unavailable` or `closed`. Original A/B UUIDs are bound through
+their PID and original registration frames, then retained even after their
+titles become identical. Geometry cases require this hook; DOM/CDP readbacks
+alone are not accepted as evidence of the manager's world-frame state.
+
+The test discovers the screen's usable work area through the disposable page's
+`screen.avail*` values. It places A and B in distinct, vertically separated
+positions, with B around 40% of the display width so its titlebar is exposed
+while A is foreground. Setup raises B and then A so the two owned windows are
+adjacent in z-order above unrelated windows; the tested external click still
+starts with A in front. The fast drag moves B into the right half. Resize and
+repeat-drag deltas keep the complete window and mouse paths inside the work area.
+The current 3440×1318-point work area and a 1280×750-point laptop work area have
+pure planning tests; smaller unsupported layouts fail before a gesture.
+
+Distinct stage-2 cases record:
+
+- The registered original frames, immutable UUIDs and originalFrame values.
+- An external real titlebar click on B, independent of manager shortcuts, and
+  the resulting native focus plus model focusedID.
+- A fast titlebar drag from the left half to the right, a real bottom-right
+  corner resize, and a second titlebar drag.
+- Two additional short titlebar drags issued consecutively without a model
+  settling wait between them; their combined final AX/model frame is checked.
+  The preferred deltas are (-64,-37) and (-54,-32) points to clear ordinary
+  snapping distances. Smaller work areas reduce them within the safe margin
+  beside A, keeping both components at least 20 points.
+- A separate corner shrink toward 160×120 points. A minimum-size constraint is
+  `PASS` only if Chrome actually changes size but applies larger dimensions.
+  Otherwise this optional observation is `NOT_OBSERVED` or `INCONCLUSIVE`.
+- Destroyed B disappearing from the model or becoming unavailable/closed, and
+  a same-title replacement remaining unregistered.
+
+The driver uses actual mouse-down/drag/up events. Before mouse-down it checks
+the exact disposable PID/CG ID, first layer-0 CG hit, exact retained AXWindow hit, original
+frame, safe display bounds, button/modifier state and foreground application.
+A guard can wait up to 600ms for the original input/foreground conditions to
+clear, without activating an app or clearing user input. Its raw HID/combined
+flags, button states and foreground PID samples are saved on success or refusal.
+Failures release an already posted mouse-down without retrying the gesture.
+Titlebar and corner contacts are chosen from safe candidates. The AX hit may be
+the window itself or resolve through its window/parent attributes; its PID and
+window CF identity must match the retained target. A higher-layer noninteractive
+overlay, such as the Dock's full-screen CG surface, does not override this exact
+AX evidence. Candidate diagnostics retain CG IDs/PIDs/layers and AX role/match
+only, without window titles or contents.
+
+After mouse-up, independent AX reads must remain stable for at least three
+samples and one second while worldFrame converges to the actual frame. A's
+native frame and both pages' values/counters must stay unchanged. The already
+confirmed model focusedID must remain B during move/resize. Existing visible
+ordinary Finder windows are checked by PID/CG ID/frame only; no Finder titles
+or file paths are read. If none exists, only the Finder geometry check is
+`SKIP`; Finder is not opened.
+
+Cursor deltas are commands, not exact frame predictions: WindowServer can snap
+or scale a real gesture. Drag requires meaningful motion in the requested
+direction with unchanged size. Resize requires size changes in the requested
+directions with unchanged origin; a click requires an unchanged frame. No-op or
+opposite-direction core gestures fail. Both rapid drags use X/Y motion; an
+independent AX sample supplies the second drag's guarded starting frame without
+waiting for model settling. Each segment and the final result are retained.
+The strict one-point comparison is between model worldFrame and actual AX frame.
+After the initial native settling grace, a stable post-release frame becomes an
+anchor. The test then watches for significant delayed displacement, including
+snapback that still leaves the window on the requested side. Failed native
+focus/foreground samples are saved before assertions. Stage 2 also requires an
+actually empty initial model and blocks shortcuts if any unrelated PID becomes
+registered; owned closed records remain valid for the destruction test.
+
+`geometry.status` covers the required geometry/model cases, separately from
+native focus and input results. Minimum-size and Finder observations retain
+their separate statuses. A requested stage-2 failure makes the run fail. No live
+stage-2 result is implied by `--check`, which compiles/signs the driver and runs
+only the pure model and work-area guard tests.

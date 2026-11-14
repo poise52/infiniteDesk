@@ -8,5 +8,6 @@ case "$arch" in arm64|x86_64) ;; *) echo "Unsupported architecture: $arch" >&2; 
 xcrun swiftc -swift-version 6 -warnings-as-errors -target "$arch-apple-macosx15.0" \
   -module-cache-path "$build/module-cache" \
   "$root/native/macos/Desktop/DesktopWindows.swift" \
+  "$root/native/macos/Desktop/DesktopObservation.swift" \
   "$root/native/macos/Desktop/Tests/main.swift" -o "$build/desktop-window-tests"
 exec "$build/desktop-window-tests"

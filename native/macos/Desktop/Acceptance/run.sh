@@ -35,6 +35,8 @@ codesign --verify --strict "$bundle"
 sh -n "$here/driver-command.sh"
 node --check "$here/run.mjs"
 if [ "$1" = --check ]; then
+  node --check "$here/geometry.mjs"
+  node --test "$here/geometry.test.mjs"
   printf 'Acceptance bundle verified: %s\nNo GUI or permissions check was performed.\n' "$bundle"
   exit 0
 fi
