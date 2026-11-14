@@ -4,26 +4,118 @@ import Foundation
 
 // The lock protects cancellation and the single mutation claim, never AX IPC.
 final class WindowTextGate: @unchecked Sendable {
+  private enum State { case pending, submitted, cancelled }
   private let lock = NSLock()
-  private var active = true
+  private var state = State.pending
   private let deadline = DispatchTime.now() + .seconds(3)
   func isActive() -> Bool {
     lock.lock()
     defer { lock.unlock() }
-    return active && DispatchTime.now() < deadline
+    return state == .pending && DispatchTime.now() < deadline
+  }
+  func canObserve() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return state != .cancelled && DispatchTime.now() < deadline
   }
   func cancel() {
     lock.lock()
-    active = false
+    state = .cancelled
     lock.unlock()
   }
   func commit(_ action: () -> AXError) -> AXError? {
     lock.lock()
-    let claimed = active && DispatchTime.now() < deadline
-    active = false
+    let claimed = state == .pending && DispatchTime.now() < deadline
+    if claimed { state = .submitted }
     lock.unlock()
     guard claimed else { return nil }
     return action()
+  }
+}
+
+enum TextReadbackSample: Equatable, Sendable {
+  case value(String?)
+  case contextChanged
+}
+
+enum TextReplacementResult: Equatable, Sendable {
+  case cancelled
+  case rejected(AXError)
+  case ambiguous(AXError)
+  case confirmed
+  case unconfirmed
+  case contextChanged
+
+  var message: String {
+    switch self {
+    case .cancelled:
+      "Text replacement cancelled before it was sent."
+    case .rejected(let error):
+      "Accessibility write failed (AX error \(error.rawValue)). Check the page before retrying."
+    case .ambiguous(let error):
+      "Accessibility delivery is uncertain (AX error \(error.rawValue)). Check the page before retrying."
+    case .confirmed:
+      "Text read back from Accessibility; page behavior is not verified."
+    case .unconfirmed:
+      "Write accepted; Accessibility has not confirmed the value. Check the page before retrying."
+    case .contextChanged:
+      "Write accepted; the target could not be revalidated. Check the page before retrying."
+    }
+  }
+}
+
+func submitTextReplacement(
+  on queue: DispatchQueue, text: String,
+  attempts: Int = 4, retryDelay: DispatchTimeInterval = .milliseconds(75),
+  deadline: DispatchTime = .now() + .seconds(2),
+  write: @Sendable () -> AXError?,
+  read: @escaping @Sendable () -> TextReadbackSample,
+  completion: @escaping @Sendable (TextReplacementResult) -> Void
+) {
+  dispatchPrecondition(condition: .onQueue(queue))
+  guard let result = write() else {
+    completion(.cancelled)
+    return
+  }
+  guard result == .success || result == .cannotComplete else {
+    completion(.rejected(result))
+    return
+  }
+  confirmTextReplacement(
+    on: queue, text: text, attempts: attempts, retryDelay: retryDelay, deadline: deadline,
+    read: read,
+    completion: { observation in
+      completion(
+        result == .cannotComplete && observation != .confirmed ? .ambiguous(result) : observation)
+    })
+}
+
+private func confirmTextReplacement(
+  on queue: DispatchQueue, text: String, attempts: Int,
+  retryDelay: DispatchTimeInterval, deadline: DispatchTime,
+  read: @escaping @Sendable () -> TextReadbackSample,
+  completion: @escaping @Sendable (TextReplacementResult) -> Void
+) {
+  dispatchPrecondition(condition: .onQueue(queue))
+  guard attempts > 0, DispatchTime.now() < deadline else {
+    completion(.unconfirmed)
+    return
+  }
+  switch read() {
+  case .contextChanged:
+    completion(.contextChanged)
+  case .value(let value) where value == text:
+    completion(.confirmed)
+  case .value:
+    guard attempts > 1, DispatchTime.now() < deadline else {
+      completion(.unconfirmed)
+      return
+    }
+    queue.asyncAfter(deadline: .now() + retryDelay) {
+      confirmTextReplacement(
+        on: queue, text: text, attempts: attempts - 1, retryDelay: retryDelay,
+        deadline: deadline, read: read, completion: completion)
+    }
   }
 }
 
@@ -58,7 +150,7 @@ private func textRect(_ element: AXUIElement) -> CGRect? {
 private func textTarget(_ app: AXUIElement, window: AXUIElement, gate: WindowTextGate)
   -> (AXUIElement, String)?
 {
-  guard gate.isActive(), let raw = textAttribute(app, kAXFocusedUIElementAttribute),
+  guard gate.canObserve(), let raw = textAttribute(app, kAXFocusedUIElementAttribute),
     CFGetTypeID(raw) == AXUIElementGetTypeID()
   else { return nil }
   let element = raw as! AXUIElement
@@ -83,7 +175,7 @@ private func textTarget(_ app: AXUIElement, window: AXUIElement, gate: WindowTex
   var inWebArea = false
   var reachedWindow = false
   for _ in 0..<64 {
-    guard gate.isActive(), AXUIElementSetMessagingTimeout(current, 0.3) == .success else {
+    guard gate.canObserve(), AXUIElementSetMessagingTimeout(current, 0.3) == .success else {
       return nil
     }
     if CFEqual(current, window) {
@@ -114,6 +206,12 @@ final class TextTarget: @unchecked Sendable {
     self.element = element
     self.title = title
   }
+}
+
+// Immutable references are used only on the serial AX queue.
+private struct TextWindowContext: @unchecked Sendable {
+  let application: AXUIElement
+  let window: AXUIElement
 }
 
 func textAccessibilityAvailable() -> Bool { AXIsProcessTrusted() }
@@ -184,14 +282,36 @@ func sendText(
       DispatchQueue.main.async { completion("Target changed or cannot be verified.") }
       return
     }
-    let result = gate.commit {
-      AXUIElementSetAttributeValue(target, kAXValueAttribute as CFString, text as CFTypeRef)
-    }
-    let readback = result == .success ? textAttribute(target, kAXValueAttribute) as? String : nil
-    let message =
-      result == .success && readback == text
-      ? "Text read back from Accessibility; page behavior is not verified."
-      : "Could not confirm text. The field may have changed."
-    DispatchQueue.main.async { completion(message) }
+    let context = TextWindowContext(application: axApp, window: window)
+    submitTextReplacement(
+      on: textQueue, text: text,
+      write: {
+        gate.commit {
+          AXUIElementSetAttributeValue(
+            expected.element, kAXValueAttribute as CFString, text as CFTypeRef)
+        }
+      },
+      read: {
+        var pid: pid_t = 0
+        guard gate.canObserve(), AXIsProcessTrusted(),
+          DispatchQueue.main.sync(execute: {
+            NSApp.isActive && !app.isTerminated
+              && NSRunningApplication(processIdentifier: identity.pid) == app
+          }),
+          AXUIElementGetPid(context.window, &pid) == .success, pid == identity.pid,
+          textAttribute(context.application, kAXFocusedWindowAttribute).map({
+            CFEqual($0, context.window)
+          })
+            == true,
+          let (currentTarget, _) = textTarget(
+            context.application, window: context.window, gate: gate),
+          CFEqual(currentTarget, expected.element), gate.canObserve()
+        else { return .contextChanged }
+        let value = textAttribute(currentTarget, kAXValueAttribute) as? String
+        return gate.canObserve() ? .value(value) : .contextChanged
+      },
+      completion: { result in
+        DispatchQueue.main.async { completion(result.message) }
+      })
   }
 }

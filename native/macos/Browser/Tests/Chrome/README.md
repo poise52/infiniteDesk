@@ -45,6 +45,11 @@ ambiguous title, or an unsupported system is an inconclusive setup, not a pass.
 
 ### Replace a Chrome field from the board
 
+Start with a fresh pair of fixture windows for this independent test. The
+**TARGET EDITED** marker is sticky; typing into the original Chrome window
+in the focus test would invalidate the initial **TARGET NOT EDITED** check.
+Record the marker and target/decoy values in both cards before sending.
+
 1. With **Chrome A** in front, click **Target text**. Return to InfiniteDesk,
    select the title bar of its card, and click **Text…**. Check that the
    identified field is the target. Type `desk-A-проверка` into the board's
