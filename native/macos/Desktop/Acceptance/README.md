@@ -27,7 +27,7 @@ or request Automation access. The desktop manager has its own Accessibility
 identity and its grant does not establish that the acceptance app can control windows.
 
 Every command, including preflight, starts the dedicated app through macOS
-LaunchServices using `open -W -n -g -j`. The executable is never invoked directly
+LaunchServices using `open -n -g -j`. The executable is never invoked directly
 by Node or a shell. This avoids attributing a raw command-line helper's access
 to Terminal or another development host. Reports include `launchContext`: the
 app's path, bundle ID, public parent-process paths, and selected environment
@@ -43,7 +43,7 @@ native/macos/Desktop/Acceptance/driver-command.sh preflight
 native/macos/Desktop/Acceptance/run.sh --run
 ```
 
-`--check` builds and ad-hoc signs the dedicated Swift 6 app with warnings treated
+`--check` builds and signs the dedicated Swift 6 app with warnings treated
 as errors, verifies the bundle signature, and parses the scripts. An unchanged
 build is reused, preserving its signature. It opens no windows and does not
 check permissions. A successful check is not a successful live acceptance run.
@@ -53,11 +53,31 @@ preflight. During a live run, leave the test's Chrome windows alone; ordinary
 typing or changing windows makes the result fail. Run only one graphical test
 at a time.
 
+Signing uses the same optional `INFINITEDESK_SIGN_IDENTITY` setting as the product
+build. The first build defaults to ad-hoc (`-`); later invocations reuse the
+recorded identity unless the variable explicitly selects another. The build
+fingerprint includes the sources and signing identity. For a local developer
+certificate, build once before reviewing the app's Accessibility grant:
+
+```sh
+INFINITEDESK_SIGN_IDENTITY=781FB0138D37428A049A4DADFF79D95F2836FA87 \
+  native/macos/Desktop/Acceptance/run.sh --check
+native/macos/Desktop/Acceptance/run.sh --run
+```
+
+The second command reuses that exact built bundle and signature without needing
+the variable again. An explicit different identity or changed source makes
+`--run` refuse the stale build; it never silently recompiles or resigns.
+
 `driver-command.sh` creates a private temporary directory for each invocation,
-launches the app without foregrounding it, and waits for exit. The app atomically
+launches the app without foregrounding it, and waits up to eight seconds for its
+atomic result. It does not use `open -W`, whose exit observer can race with a
+short-lived app. The app atomically
 writes a versioned JSON envelope containing the command result and its actual
 exit code. The wrapper validates this envelope, prints the result, and propagates
 0, 1, or 77. It does not treat `open`'s own success as the app's success. Command
+results take precedence even if the launcher exits with an error. Missing or
+invalid results retain launcher/app diagnostics and never cause an action retry.
 scratch files are removed after reading; the Chrome report directory is retained.
 
 The driver permits native operations only against a live `com.google.Chrome`
@@ -65,7 +85,12 @@ PID. The orchestrator independently verifies that this PID is the exact child
 process it launched with a temporary user-data directory. Before every input
 operation it verifies that the expected disposable native window is frontmost.
 Typing uses PID-targeted Unicode key events. Global shortcut events are emitted
-only while that expected fixture window is frontmost:
+only while that expected fixture window is frontmost.
+
+Shortcut events use an isolated private event source and retain only the
+constructor's inherent Fn/NumPad flags alongside the requested modifiers. This
+preserves native arrow-key classification without importing unrelated physical
+or previously synthesized modifier state.
 
 | Operation | Shortcut |
 | --- | --- |
@@ -110,6 +135,22 @@ Each listed live case starts as `NOT_RUN` and changes to `PASS` only at its
 completed checkpoint. The setup-input checkpoint does not by itself establish
 that the manager registered the windows; subsequent successful shortcuts supply
 that behavior evidence.
+
+Schema 2 reports separate `nativeFocusCases`/`nativeFocusStatus` from
+`inputCases`/`inputStatus`. A probe-token delivery failure is recorded and does
+not stop registering the second window or exercising subsequent shortcuts.
+Each native cycle is assessed before any trial characters are posted. A native
+focus/geometry failure still stops the run because further input would be
+unsafe. The overall result remains `FAIL` when any input probe fails, even when
+all independent native focus cases pass. Combined `cases` require both results.
+
+Every input attempt records both pages before and after: native focus/frames,
+target and decoy values, DOM readouts/counters, active field and selection/caret.
+The fixture also records trusted keyboard, beforeinput, input and focus events,
+including their modifier flags. Fatal errors save a final `failureEvidence`
+snapshot before Chrome cleanup. Failed delivery is never repaired with CDP
+insertion or a focus change, and the next probe uses its own observed baseline
+instead of a value assumed to have been typed successfully.
 
 This harness does not inject a delayed backend completion. That cancellation
 case must be assessed from the backend test results separately. Frame readbacks

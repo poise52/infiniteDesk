@@ -6,7 +6,12 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../../../.." && pwd)
 build="$root/target/desktop-acceptance"
 bundle="$build/InfiniteDesk Acceptance.app"
-fingerprint=$(shasum -a 256 "$here/Driver.swift" "$here/Info.plist" | shasum -a 256 | awk '{print $1}')
+identity=${INFINITEDESK_SIGN_IDENTITY-}
+if [ -z "$identity" ]; then
+  if [ -r "$build/build-identity" ]; then identity=$(cat "$build/build-identity"); else identity=-; fi
+fi
+sources=$(shasum -a 256 "$here/Driver.swift" "$here/Info.plist" "$here/run.sh" | shasum -a 256 | awk '{print $1}')
+fingerprint=$(printf '%s\n%s\n' "$sources" "$identity" | shasum -a 256 | awk '{print $1}')
 current=''
 if [ -r "$build/build-fingerprint" ]; then current=$(cat "$build/build-fingerprint"); fi
 if [ "$fingerprint" != "$current" ] || [ ! -x "$bundle/Contents/MacOS/Driver" ]; then
@@ -19,7 +24,9 @@ if [ "$fingerprint" != "$current" ] || [ ! -x "$bundle/Contents/MacOS/Driver" ];
     -module-cache-path "$build/module-cache" "$here/Driver.swift" -o "$bundle/Contents/MacOS/Driver"
   cp "$here/Info.plist" "$bundle/Contents/Info.plist"
   plutil -lint "$bundle/Contents/Info.plist"
-  codesign --force --sign - --timestamp=none --identifier org.infinitedesk.tests.desktop-acceptance "$bundle"
+  codesign --force --sign "$identity" --timestamp=none --identifier org.infinitedesk.tests.desktop-acceptance "$bundle"
+  codesign --verify --strict "$bundle"
+  printf '%s\n' "$identity" > "$build/build-identity"
   printf '%s\n' "$fingerprint" > "$build/build-fingerprint"
 else
   echo 'Reusing unchanged acceptance bundle.'

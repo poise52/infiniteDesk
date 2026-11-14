@@ -19,12 +19,12 @@ const caseNames = [
   'Closed B with identical-title replacement did not retarget input',
 ];
 function native(...args) {
-  const result = spawnSync(driver, args.map(String), { encoding: 'utf8', timeout: 12_000 });
+  const result = spawnSync(driver, args.map(String), { encoding: 'utf8', timeout: 15_000 });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(result.stdout.trim() || result.stderr.trim());
   return JSON.parse(result.stdout);
 }
-const check = spawnSync(driver, ['preflight'], { encoding: 'utf8', timeout: 5_000 });
+const check = spawnSync(driver, ['preflight'], { encoding: 'utf8', timeout: 15_000 });
 if (check.status === 77) {
   process.stdout.write(check.stdout);
   const skippedDirectory = await mkdtemp(join(tmpdir(), 'infinitedesk-desktop-acceptance-'));
@@ -89,12 +89,17 @@ class CDP {
 
 const directory = await mkdtemp(join(tmpdir(), 'infinitedesk-desktop-acceptance-'));
 const report = {
+  schemaVersion: 2,
   status: 'RUNNING', started: new Date().toISOString(),
   platform: process.platform, architecture: process.arch, node: process.version,
   directory, prerequisites: JSON.parse(check.stdout),
   scope: 'Real desktop manager keyboard shortcuts; disposable Chrome only',
   checkpoints: [],
   inputEvidence: [],
+  inputCases: {},
+  nativeFocusCases: Object.fromEntries(caseNames.slice(1).map(name => [name, 'NOT_RUN'])),
+  nativeFocusStatus: 'NOT_RUN',
+  inputStatus: 'NOT_RUN',
   cases: Object.fromEntries(caseNames.map(name => [name, 'NOT_RUN'])),
   unverified: [
     'Delayed stale completion: not injected into the production app; consult backend test results separately',
@@ -149,52 +154,108 @@ function sameFrame(a, b) {
   return ['x', 'y', 'width', 'height'].every(key => Math.abs(a[key] - b[key]) <= 1);
 }
 function unchanged(snapshot, baseline) {
+  assert(snapshot && Array.isArray(snapshot.windows), 'Native snapshot is unavailable or invalid');
   for (const window of baseline) {
     const current = snapshot.windows.find(item => item.id === window.id);
     assert(current, `Registered CG window ${window.id} is missing`);
     assert(sameFrame(current.frame, window.frame), `Native frame changed for ${window.id}: ${JSON.stringify(current.frame)}`);
   }
 }
-const expected = { A: 'TARGET-A', B: 'TARGET-B' };
-const counts = { A: 0, B: 0 };
+function requireNative(observed) {
+  if (observed.nativeError) throw new Error(`Native observation failed: ${observed.nativeError}`);
+  assert(observed.native, 'Native observation did not return a snapshot');
+  return observed.native;
+}
 async function values(name) {
   return evaluate(targets[name], `({target: document.querySelector('#target').value,
     decoy: document.querySelector('#decoy').value, output: document.querySelector('#value').textContent,
     count: Number(document.querySelector('#count').textContent), focused: document.hasFocus(),
-    active: document.activeElement?.id})`);
+    active: document.activeElement?.id, title: document.title, visibility: document.visibilityState,
+    selection: {start: document.querySelector('#target').selectionStart,
+      end: document.querySelector('#target').selectionEnd, direction: document.querySelector('#target').selectionDirection},
+    events: (window.fixtureEvents ?? []).slice(-40)})`);
 }
-async function validateValues(names = ['A', 'B']) {
-  const result = {};
-  for (const name of names) {
-    result[name] = await values(name);
-    assert.equal(result[name].target, expected[name], `Wrong original ${name} DOM value`);
-    assert.equal(result[name].output, expected[name], `Original ${name} input event did not update the page`);
-    assert.equal(result[name].decoy, `DECOY-${name}`, `Original ${name} decoy was changed`);
-    assert(result[name].count >= counts[name], `Original ${name} input event was not observed`);
+async function evidence() {
+  const result = { at: new Date().toISOString(), dom: {} };
+  try { result.native = snapshot(); } catch (error) { result.nativeError = String(error); }
+  for (const name of Object.keys(targets)) {
+    try { result.dom[name] = await values(name); }
+    catch (error) { result.dom[name] = { error: String(error) }; }
   }
   return result;
 }
-async function typeToken(name, id, suffix) {
-  const beforeNative = snapshot();
-  assert.equal(beforeNative.frontmostPID, pid, 'Typing must not activate the application');
-  assert.equal(beforeNative.focusedID, id, 'Typing must not select the destination window');
-  const beforeDOM = await values(name);
-  assert.equal(beforeDOM.focused, true, `Original ${name} did not have native page focus before typing`);
-  assert.equal(beforeDOM.active, 'target', `Original ${name} target was not already the active field`);
-  report.inputEvidence.push({ at: new Date().toISOString(), name, id, token: suffix, beforeNative, beforeDOM });
-  native('type', pid, id, suffix);
-  expected[name] += suffix;
-  counts[name] += 1;
-  await eventually(`Typed token did not reach original ${name}`, () => values(name), value => value.target === expected[name]);
+async function saveReport() {
+  await writeFile(join(directory, 'report.json'), JSON.stringify(report, null, 2));
 }
-async function checkpoint(label, baseline, names = ['A', 'B']) {
+async function typeToken(label, name, id, suffix) {
+  const attempt = { label, name, id, token: suffix, status: 'RUNNING', before: await evidence() };
+  report.inputEvidence.push(attempt);
+  try {
+    const beforeNative = requireNative(attempt.before);
+    assert.equal(beforeNative?.frontmostPID, pid, 'Typing must not activate the application');
+    assert.equal(beforeNative?.focusedID, id, 'Typing must not select the destination window');
+    const beforeDOM = attempt.before.dom[name];
+    assert.equal(beforeDOM.focused, true, `Original ${name} did not have native page focus before typing`);
+    assert.equal(beforeDOM.active, 'target', `Original ${name} target was not already the active field`);
+    assert.equal(beforeDOM.selection.start, beforeDOM.target.length, 'Native typing probe requires an existing caret at the end');
+    assert.equal(beforeDOM.selection.end, beforeDOM.target.length, 'Native typing probe requires no selection');
+    attempt.expected = beforeDOM.target + suffix;
+    attempt.driverResult = native('type', pid, id, suffix);
+    await eventually(`Typed token did not reach original ${name}`, async () => {
+      const value = await values(name);
+      const { events, ...summary } = value;
+      return summary;
+    }, value => value.target === attempt.expected);
+  } catch (error) {
+    attempt.error = error.stack ?? String(error);
+  }
+  attempt.after = await evidence();
+  try {
+    if (attempt.error) throw new Error(attempt.error);
+    const before = attempt.before.dom[name];
+    const after = attempt.after.dom[name];
+    assert.equal(after.target, attempt.expected);
+    assert.equal(after.output, attempt.expected, 'The page did not process the native input event');
+    assert(after.count > before.count, 'No DOM input event was observed');
+    for (const [otherName, previous] of Object.entries(attempt.before.dom)) {
+      const current = attempt.after.dom[otherName];
+      if (previous.error || current?.error) continue;
+      assert.equal(current.decoy, previous.decoy, `${otherName} decoy changed`);
+      if (otherName !== name) {
+        for (const field of ['target', 'output', 'count']) {
+          assert.equal(current[field], previous[field], `Input leaked into ${otherName} ${field}`);
+        }
+      }
+    }
+    attempt.status = 'PASS';
+  } catch (error) {
+    attempt.status = 'FAIL';
+    attempt.error ??= error.stack ?? String(error);
+  }
+  report.inputCases[label] = attempt.status;
+  report.inputStatus = Object.values(report.inputCases).includes('FAIL') ? 'FAIL' : 'INCOMPLETE';
+  console.log(`${attempt.status}: native input ${label}`);
+  if (attempt.status === 'FAIL') {
+    const dom = Object.fromEntries(Object.entries(attempt.after.dom).map(([page, value]) => {
+      const { events, ...summary } = value;
+      return [page, summary];
+    }));
+    console.error(JSON.stringify({ label, error: attempt.error.split('\n')[0], native: attempt.after.native, dom }));
+  }
+  await saveReport();
+  return attempt.status === 'PASS';
+}
+async function nativeCheckpoint(label, baseline, expectedID) {
   const state = snapshot();
   unchanged(state, baseline);
-  const dom = await validateValues(names);
-  report.checkpoints.push({ label, at: new Date().toISOString(), native: state, dom });
-  report.cases[label] = 'PASS';
-  console.log(`PASS: ${label}`);
-  await writeFile(join(directory, 'report.json'), JSON.stringify(report, null, 2));
+  assert.equal(state.frontmostPID, pid);
+  assert.equal(state.focusedID, expectedID);
+  const observed = await evidence();
+  report.checkpoints.push({ label, scope: 'native focus and unchanged frames; input assessed separately',
+    native: state, observed });
+  report.nativeFocusCases[label] = 'PASS';
+  console.log(`PASS: native focus ${label}`);
+  await saveReport();
 }
 
 try {
@@ -235,27 +296,35 @@ try {
   assert(!sameFrame(a.frame, b.frame), 'The test requires distinct noncentral native frames');
   const baseline = [a, b];
   report.originals = { A: a, B: b };
+  let setupInputPassed = true;
   for (const [name, window] of [['A', a], ['B', b]]) {
     native('focus', pid, window.id);
     await evaluate(targets[name], `(() => { const field = document.querySelector('#target'); field.focus();
       field.setSelectionRange(field.value.length, field.value.length); })()`);
-    await typeToken(name, window.id, `-original-${name}`);
+    const inputPassed = await typeToken(`Setup ${name}`, name, window.id, `-original-${name}`);
+    setupInputPassed = inputPassed && setupInputPassed;
     native('shortcut', pid, window.id, 'register');
     // The production registration has no external completion API. Subsequent
     // focus/DOM assertions fail if the hotkey was not actually registered.
     await pause(500);
   }
   report.registrationShortcutsSent = 2;
-  await checkpoint('Original A/B setup input', baseline);
+  report.cases['Original A/B setup input'] = setupInputPassed ? 'PASS' : 'FAIL';
+  report.setupEvidence = await evidence();
+  unchanged(requireNative(report.setupEvidence), baseline);
+  await saveReport();
   let selected = b;
   async function cycle(direction, destination, name, token, label, remaining = baseline) {
+    report.activeNativeCase = label;
     native('shortcut', pid, selected.id, direction);
     const state = await eventually(`Expected native focus on original ${name}`, async () => snapshot(),
       value => value.frontmostPID === pid && value.focusedID === destination.id);
     unchanged(state, remaining);
     selected = destination;
-    await typeToken(name, destination.id, token);
-    await checkpoint(label, remaining, remaining.length === 1 ? ['A'] : ['A', 'B']);
+    await nativeCheckpoint(label, remaining, destination.id);
+    const inputPassed = await typeToken(label, name, destination.id, token);
+    report.cases[label] = inputPassed ? 'PASS' : 'FAIL';
+    await saveReport();
   }
   await cycle('left', a, 'A', '-cycle-A1', 'A/B/A: first A');
   await cycle('right', b, 'B', '-cycle-B', 'A/B/A: B');
@@ -286,6 +355,7 @@ try {
   report.replacement = replacement;
   native('focus', pid, a.id);
   selected = a;
+  report.activeNativeCase = 'Closed B with identical-title replacement did not retarget input';
   native('shortcut', pid, a.id, 'right');
   const refusalDeadline = Date.now() + 1_500;
   do {
@@ -295,16 +365,29 @@ try {
     unchanged(state, [a, replacement]);
     await pause(75);
   } while (Date.now() < refusalDeadline);
-  await typeToken('A', a.id, '-closed-B-refused');
+  await nativeCheckpoint('Closed B with identical-title replacement did not retarget input', [a, replacement], a.id);
+  const closedInputPassed = await typeToken('Closed B with identical-title replacement did not retarget input', 'A', a.id, '-closed-B-refused');
   const replacementDOM = await evaluate(targets.replacement, `({target: document.querySelector('#target').value,
     decoy: document.querySelector('#decoy').value, count: document.querySelector('#count').textContent})`);
-  assert.deepEqual(replacementDOM, { target: 'TARGET-B', decoy: 'DECOY-B', count: '0' });
   report.replacementDOM = replacementDOM;
-  await checkpoint('Closed B with identical-title replacement did not retarget input', [a, replacement], ['A']);
-  report.status = 'PASS';
+  const replacementUntouched = replacementDOM.target === 'TARGET-B' && replacementDOM.decoy === 'DECOY-B' && replacementDOM.count === '0';
+  report.cases['Closed B with identical-title replacement did not retarget input'] = closedInputPassed && replacementUntouched ? 'PASS' : 'FAIL';
+  if (!replacementUntouched) {
+    report.replacementInputFailure = 'The unregistered replacement was edited; native focus result is separate';
+  }
+  unchanged(snapshot(), [a, replacement]);
+  report.nativeFocusStatus = 'PASS';
+  report.inputStatus = Object.values(report.inputCases).every(value => value === 'PASS') && replacementUntouched ? 'PASS' : 'FAIL';
+  report.status = report.inputStatus;
+  if (report.status === 'FAIL') process.exitCode = 1;
 } catch (error) {
   report.status = 'FAIL';
   report.error = error.stack ?? String(error);
+  report.nativeFocusStatus = 'INCOMPLETE';
+  if (report.activeNativeCase && report.nativeFocusCases[report.activeNativeCase] !== 'PASS') {
+    report.nativeFocusCases[report.activeNativeCase] = 'FAIL';
+  }
+  report.failureEvidence = browserIdentityVerified ? await evidence() : { reason: 'Disposable browser identity was not established' };
   process.exitCode = 1;
   console.error(report.error);
 } finally {

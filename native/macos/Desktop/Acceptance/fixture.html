@@ -20,6 +20,17 @@
   target.value = `TARGET-${id}`;
   document.querySelector('#decoy').value = `DECOY-${id}`;
   let count = 0;
+  window.fixtureEvents = [];
+  for (const type of ['keydown', 'keyup', 'beforeinput', 'input', 'focusin', 'focusout']) {
+    document.addEventListener(type, event => {
+      window.fixtureEvents.push({type, at: performance.now(), trusted: event.isTrusted,
+        target: event.target.id ?? '', active: document.activeElement?.id, key: event.key,
+        code: event.code, data: event.data, inputType: event.inputType,
+        ctrl: event.ctrlKey, alt: event.altKey, meta: event.metaKey, shift: event.shiftKey,
+        value: target.value, focused: document.hasFocus()});
+      window.fixtureEvents = window.fixtureEvents.slice(-80);
+    }, true);
+  }
   function update() {
     document.querySelector('#value').textContent = target.value;
     document.querySelector('#count').textContent = count;

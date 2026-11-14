@@ -12,29 +12,52 @@ operation_dir=$(mktemp -d "${TMPDIR:-/tmp}/infinitedesk-driver-command.XXXXXXXX"
 trap 'rm -rf "$operation_dir"' 0
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
-if ! /usr/bin/open -W -n -g -j --stdout "$operation_dir/app.stdout" --stderr "$operation_dir/app.stderr" \
-  "$bundle" --args --result "$operation_dir/result.json" "$@"; then
-  echo 'LaunchServices could not complete the acceptance command' >&2
-  exit 1
-fi
-python3 - "$operation_dir/result.json" "$operation_dir/app.stderr" <<'PY'
+python3 - "$bundle" "$operation_dir" "$@" <<'PY'
 import json
 import pathlib
+import subprocess
 import sys
+import time
 
+bundle, scratch = sys.argv[1], pathlib.Path(sys.argv[2])
+result_path = scratch / "result.json"
+launcher = None
 try:
-    envelope = json.loads(pathlib.Path(sys.argv[1]).read_text())
-    if envelope.get("protocolVersion") != 1 or type(envelope.get("exitCode")) is not int:
+    with (scratch / "open.stdout").open("w") as stdout, (scratch / "open.stderr").open("w") as stderr:
+        launcher = subprocess.Popen([
+            "/usr/bin/open", "-n", "-g", "-j", "--stdout", str(scratch / "app.stdout"),
+            "--stderr", str(scratch / "app.stderr"), bundle,
+            "--args", "--result", str(result_path), *sys.argv[3:]
+        ], stdout=stdout, stderr=stderr)
+    deadline = time.monotonic() + 8
+    while not result_path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"No atomic command result within 8 seconds; open status={launcher.poll()}. Outcome is unknown; the action was not retried")
+        time.sleep(0.025)
+    envelope = json.loads(result_path.read_text())
+    if not isinstance(envelope, dict) or envelope.get("protocolVersion") != 1 or type(envelope.get("exitCode")) is not int:
         raise ValueError("invalid result protocol")
     code = envelope["exitCode"]
     if code not in (0, 1, 77) or not isinstance(envelope.get("result"), dict):
         raise ValueError("invalid command result")
-except (OSError, ValueError, TypeError) as error:
+except (OSError, ValueError, TypeError, TimeoutError) as error:
     print(f"Acceptance app did not return a valid status: {error}", file=sys.stderr)
-    stderr = pathlib.Path(sys.argv[2])
-    if stderr.exists():
-        print(stderr.read_text(), file=sys.stderr)
+    for name in ("open.stderr", "app.stderr"):
+        path = scratch / name
+        if path.exists():
+            print(f"{name}: {path.read_text()}", file=sys.stderr)
     sys.exit(1)
+finally:
+    if launcher is not None:
+        try:
+            launcher.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            launcher.terminate()
+            try:
+                launcher.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                launcher.kill()
+                launcher.wait()
 print(json.dumps(envelope["result"], separators=(",", ":")))
 sys.exit(code)
 PY

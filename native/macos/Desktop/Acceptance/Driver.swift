@@ -76,11 +76,15 @@ func focusedID(_ app: AXUIElement, windows: [Window]) -> CGWindowID? {
 }
 
 func postKey(_ code: CGKeyCode, flags: CGEventFlags, pid: pid_t? = nil) throws {
+  guard let source = CGEventSource(stateID: .privateState) else {
+    throw Failure.message("Cannot create isolated key event source")
+  }
   for down in [true, false] {
-    guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else {
+    guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else {
       throw Failure.message("Cannot create key event")
     }
-    event.flags = flags
+    let intrinsic = event.flags.intersection([.maskNumericPad, .maskSecondaryFn])
+    event.flags = flags.union(intrinsic)
     if let pid { event.postToPid(pid) } else { event.post(tap: .cghidEventTap) }
     Thread.sleep(forTimeInterval: 0.025)
   }
