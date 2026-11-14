@@ -10,15 +10,18 @@ final class WindowPickerCoordinator: NSObject, SCContentSharingPickerObserver {
   }
   private var owners: [ObjectIdentifier: WeakOwner] = [:]
   private var pending: WeakOwner?
+  private var pendingStream: SCStream?
   private var pendingCancelled = false
   private var registered = false
 
-  func present(_ owner: WindowCapture) -> Bool {
+  func present(_ owner: WindowCapture, replacing stream: SCStream?) -> Bool {
     guard pending == nil else { return false }
     owners[ObjectIdentifier(owner)] = WeakOwner(owner)
     pending = WeakOwner(owner)
+    pendingStream = stream
     pendingCancelled = false
     let picker = SCContentSharingPicker.shared
+    picker.maximumStreamCount = 3
     var configuration = SCContentSharingPickerConfiguration()
     configuration.allowedPickerModes = .singleWindow
     if let bundle = Bundle.main.bundleIdentifier { configuration.excludedBundleIDs = [bundle] }
@@ -28,7 +31,11 @@ final class WindowPickerCoordinator: NSObject, SCContentSharingPickerObserver {
       registered = true
     }
     picker.isActive = true
-    picker.present(using: .window)
+    if let stream {
+      picker.present(for: stream, using: .window)
+    } else {
+      picker.present(using: .window)
+    }
     return true
   }
 
@@ -49,6 +56,7 @@ final class WindowPickerCoordinator: NSObject, SCContentSharingPickerObserver {
   private func takePending() -> WindowCapture? {
     let owner = pendingCancelled ? nil : pending?.value
     pending = nil
+    pendingStream = nil
     pendingCancelled = false
     updateActivity()
     return owner
@@ -59,11 +67,11 @@ final class WindowPickerCoordinator: NSObject, SCContentSharingPickerObserver {
   ) {
     let streamID = stream.map(ObjectIdentifier.init)
     Task { @MainActor in
-      if let streamID {
+      if self.pending != nil && self.pendingStream.map(ObjectIdentifier.init) == streamID {
+        self.takePending()?.pickerCancelled()
+      } else if let streamID {
         self.owners.values.compactMap(\.value).first { $0.ownsPickerStream(streamID) }?
           .pickerCancelled()
-      } else {
-        self.takePending()?.pickerCancelled()
       }
     }
   }
@@ -78,11 +86,11 @@ final class WindowPickerCoordinator: NSObject, SCContentSharingPickerObserver {
   ) {
     let streamID = stream.map(ObjectIdentifier.init)
     Task { @MainActor in
-      if let streamID {
+      if self.pending != nil && self.pendingStream.map(ObjectIdentifier.init) == streamID {
+        self.takePending()?.pickerUpdated(filter, streamID: streamID)
+      } else if let streamID {
         self.owners.values.compactMap(\.value).first { $0.ownsPickerStream(streamID) }?
           .pickerUpdated(filter, streamID: streamID)
-      } else {
-        self.takePending()?.pickerUpdated(filter, streamID: nil)
       }
     }
   }

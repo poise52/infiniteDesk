@@ -98,9 +98,9 @@ final class WindowCapture: NSObject, SCStreamDelegate {
   }
 
   func selectWindow() {
-    guard !destroyed, !picking else { return }
+    guard !destroyed, !picking, !focusTransition else { return }
     cancelPendingFocus()
-    guard WindowPickerCoordinator.shared.present(self) else {
+    guard WindowPickerCoordinator.shared.present(self, replacing: stream) else {
       onUpdate?("Finish the other window selection first", false)
       return
     }
@@ -130,7 +130,8 @@ final class WindowCapture: NSObject, SCStreamDelegate {
   }
 
   func pickerUpdated(_ filter: SCContentFilter, streamID: ObjectIdentifier?) {
-    if let stream, streamID == ObjectIdentifier(stream), !picking {
+    if let stream, streamID == ObjectIdentifier(stream) {
+      endPicker()
       updateExisting(stream, filter: filter)
     } else if streamID == nil {
       begin(filter)
