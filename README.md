@@ -1,5 +1,8 @@
 # InfiniteDesk
 
+> [!WARNING]
+> **Do not download or install InfiniteDesk.** The project is unfinished. The build instructions below are for development and testing only.
+
 InfiniteDesk is a native macOS canvas. A card can position a real application window on the desktop, host an embedded WebKit browser or show an optional live preview. The command-line demo renders a deterministic scene of virtual windows for navigation and performance tests.
 
 ## Requirements
