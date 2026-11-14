@@ -40,7 +40,7 @@ pub fn scene() -> Result<Scene> {
     let mut scene = Scene::default();
     scene.add(Card::new(
         WindowId(0),
-        "Browser · drag header to move".into(),
+        "Window · drag header to move".into(),
         WorldRect::new(WorldPoint::new(-450.0, -325.0)?, 900.0, 650.0)?,
         [90, 130, 120, 255],
         0,

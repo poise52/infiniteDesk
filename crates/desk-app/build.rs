@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg(out.join("swift-module-cache"))
         .args(["-emit-library", "-module-name", "DeskBrowser"])
         .arg(&source)
+        .arg(source.with_file_name("WindowCapture.swift"))
         .args([
             "-Xlinker",
             "-install_name",

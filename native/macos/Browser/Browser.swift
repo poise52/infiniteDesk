@@ -53,6 +53,11 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
   let forward = NSButton(title: "›", target: nil, action: nil)
   let home = NSButton(title: "⌂", target: nil, action: nil)
   let status = NSTextField(labelWithString: "")
+  let capture = WindowCapture()
+  let preview = NSView()
+  let chooseWindow = NSButton(title: "Window…", target: nil, action: nil)
+  let returnToWeb = NSButton(title: "Web", target: nil, action: nil)
+  let openApp = NSButton(title: "Open app", target: nil, action: nil)
   let chromeHeight: CGFloat = 44
   var escapeMonitor: Any?
 
@@ -78,11 +83,42 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     address.target = self
     address.action = #selector(navigate)
     address.delegate = self
+    chooseWindow.target = self
+    chooseWindow.action = #selector(selectWindow)
+    returnToWeb.target = self
+    returnToWeb.action = #selector(showWeb)
+    openApp.target = self
+    openApp.action = #selector(openSourceApplication)
+    preview.wantsLayer = true
+    preview.layer?.addSublayer(capture.layer)
+    preview.isHidden = true
+    returnToWeb.isHidden = true
+    openApp.isHidden = true
+    capture.onUpdate = { [weak self] message, started in
+      guard let self else { return }
+      self.status.stringValue = message
+      self.status.isHidden = false
+      self.openApp.isEnabled = self.capture.canOpenApplication
+      if started {
+        self.webView.isHidden = true
+        self.preview.isHidden = false
+        self.back.isHidden = true
+        self.forward.isHidden = true
+        self.home.isHidden = true
+        self.address.isHidden = true
+        self.returnToWeb.isHidden = false
+        self.openApp.isHidden = !self.capture.canOpenApplication
+      }
+    }
     surface.addSubview(back)
     surface.addSubview(forward)
     surface.addSubview(home)
     surface.addSubview(address)
     surface.addSubview(webView)
+    surface.addSubview(preview)
+    surface.addSubview(chooseWindow)
+    surface.addSubview(returnToWeb)
+    surface.addSubview(openApp)
     surface.addSubview(status)
     webView.navigationDelegate = self
     webView.uiDelegate = self
@@ -135,12 +171,32 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     setFrame(back, NSRect(x: 6, y: 7, width: 30, height: 30))
     setFrame(forward, NSRect(x: 38, y: 7, width: 30, height: 30))
     setFrame(home, NSRect(x: 70, y: 7, width: 30, height: 30))
-    setFrame(address, NSRect(x: 106, y: 9, width: max(1, width - 114), height: 25))
+    setFrame(address, NSRect(x: 106, y: 9, width: max(1, width - 220), height: 25))
+    setFrame(chooseWindow, NSRect(x: width - 106, y: 7, width: 100, height: 30))
+    setFrame(returnToWeb, NSRect(x: 6, y: 7, width: 70, height: 30))
+    setFrame(openApp, NSRect(x: 80, y: 7, width: 100, height: 30))
     setFrame(webView, NSRect(x: 0, y: chromeHeight, width: width, height: height - chromeHeight))
+    setFrame(preview, NSRect(x: 0, y: chromeHeight, width: width, height: height - chromeHeight))
+    capture.layer.frame = preview.bounds
     setFrame(status, NSRect(x: 8, y: height - 24, width: max(1, width - 16), height: 18))
     status.isHidden = status.stringValue.isEmpty
   }
 
+  @objc func selectWindow() { capture.selectWindow() }
+  @objc func openSourceApplication() { capture.openApplication() }
+  @objc func showWeb() {
+    capture.stop()
+    webView.isHidden = false
+    preview.isHidden = true
+    back.isHidden = false
+    forward.isHidden = false
+    home.isHidden = false
+    address.isHidden = false
+    returnToWeb.isHidden = true
+    openApp.isHidden = true
+    status.stringValue = ""
+    status.isHidden = true
+  }
   @objc func goBack() { if webView.canGoBack { webView.goBack() } }
   @objc func goForward() { if webView.canGoForward { webView.goForward() } }
   @objc func goHome() {
@@ -206,6 +262,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     return nil
   }
   func destroy() {
+    capture.destroy()
     if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
     escapeMonitor = nil
     webView.stopLoading()

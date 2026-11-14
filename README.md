@@ -1,6 +1,6 @@
 # InfiniteDesk
 
-InfiniteDesk is a native macOS canvas. The Finder app opens an interactive WebKit browser on the board. The command-line demo renders a deterministic scene of virtual windows for navigation and performance tests.
+InfiniteDesk is a native macOS canvas. The Finder app displays a WebKit browser or a live view of a window you select. The command-line demo renders a deterministic scene of virtual windows for navigation and performance tests.
 
 ## Requirements
 
@@ -20,6 +20,16 @@ Drag the card by its title bar. Use the empty board to pan or zoom, or press
 Escape in the browser to return keyboard focus to the board. The browser runs
 inside InfiniteDesk and can be opened without screen recording or accessibility
 permissions. For the 1,000-window scene, use the `--demo` command below.
+
+Click **Window…** in the card and choose a window in the macOS sharing picker.
+Its live image appears in the same card. To interact with the source, click
+**Open app**, available when macOS 15.2 or later identifies the owning app.
+If that app has several windows, macOS chooses which one comes forward.
+**Web** stops the capture and returns to the web page. Capture is limited to
+one window, up to 15 frames per second and 1600 × 1200 pixels.
+
+Run `native/macos/Browser/Tests/run.sh` in a graphical macOS session to check
+live frame updates and stopping capture with a synthetic window.
 
 Install the optional verification tools with:
 
@@ -54,7 +64,7 @@ Controls:
 
 Selection applies to demo windows only. Close the native window to exit. The app redraws on demand and reconfigures its surface after a resize.
 
-`desk-app` owns the event loop and window lifecycle; `desk-render` owns GPU resources. `desk-core` provides validated f64 world geometry, logical and physical coordinate conversion, a camera, and deterministic virtual window scenes. World coordinates are limited to ±1e12, zoom to 1e-7–100 logical pixels per world unit, and display scale to 0.25–16; these are application limits rather than macOS limits. At 1e12, f64 quantization is about 0.000122 world units. Rectangle edges are half-open; edge contact does not count as overlap. A zero-sized viewport is rejected, so callers skip viewport operations when minimized. Native capture and accessibility adapters are not yet implemented. Titles use bundled IBM Plex Mono, with its license and provenance in `crates/desk-render/assets/`. Glyphs not supported by the bundled font may be unavailable. Text layouts are cached only for visible titles, so a title returning on-screen may be reshaped; new scales can also rasterize glyphs on redraw. Total font-cache memory and frame latency have not yet been measured. GPU behavior and native window interaction require a real graphical macOS session; CI checks do not exercise them. A lost GPU device causes a graceful exit; device recovery is deferred to a later renderer milestone.
+`desk-app` owns the event loop and window lifecycle; `desk-render` owns GPU resources. `desk-core` provides validated f64 world geometry, logical and physical coordinate conversion, a camera, and deterministic virtual window scenes. World coordinates are limited to ±1e12, zoom to 1e-7–100 logical pixels per world unit, and display scale to 0.25–16; these are application limits rather than macOS limits. At 1e12, f64 quantization is about 0.000122 world units. Rectangle edges are half-open; edge contact does not count as overlap. A zero-sized viewport is rejected, so callers skip viewport operations when minimized. The Finder app displays the selected window through a native layer. Experimental Accessibility input runs in the separate macOS probe. Titles use bundled IBM Plex Mono, with its license and provenance in `crates/desk-render/assets/`. Glyphs not supported by the bundled font may be unavailable. Text layouts are cached only for visible titles, so a title returning on-screen may be reshaped; new scales can also rasterize glyphs on redraw. Total font-cache memory and frame latency have not yet been measured. GPU behavior and native window interaction require a real graphical macOS session; CI checks do not exercise them. A lost GPU device causes a graceful exit; device recovery is deferred to a later renderer milestone.
 
 The text stack currently depends on `ttf-parser` 0.25.1, which is unmaintained ([RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192)); the font database loads only the bundled trusted font. It also uses `lru` 0.16.4, affected by [RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253); glyphon uses Copy keys and `pop_lru`, while the advisory requires `pop` with a panicking key destructor. Both advisory-specific cargo-deny exceptions must be reviewed when upstream dependencies change and removed when replacements are available. `cargo audit` continues to report both warnings.
 
