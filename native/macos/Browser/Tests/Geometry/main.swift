@@ -97,4 +97,79 @@ MainActor.assumeIsolated {
     frame.normalizedPoint(center, in: preview.bounds, flipped: preview.isFlipped),
     CGPoint(x: 0.5, y: 0.5), "clipped and zoomed flipped ancestor to unflipped preview")
 }
-print("PASS: \(checks) capture/preview geometry checks")
+MainActor.assumeIsolated {
+  let card = CGRect(x: 100, y: 80, width: 600, height: 400)
+  let blocker = CGRect(x: 500, y: 200, width: 300, height: 300)
+  let pieces = browserUncoveredRectangles(card, occluders: [blocker])
+  check(
+    pieces.allSatisfy { $0.intersection(blocker).isEmpty }, "native target excludes upper cards")
+  check(pieces.allSatisfy { card.contains($0) }, "native target stays inside visible card")
+  check(
+    browserUncoveredRectangles(card, occluders: [card]).isEmpty,
+    "fully covered card has no native target")
+  check(browserRectArea(.null) == 0, "disjoint display intersection has zero area")
+  let root = Flipped(frame: CGRect(x: 0, y: 0, width: 1200, height: 800))
+  let surface = Flipped(frame: CGRect(x: 100, y: 80, width: 600, height: 400))
+  surface.bounds = CGRect(x: 0, y: 0, width: 600, height: 400)
+  root.addSubview(surface)
+  let content = CGRect(x: 0, y: 52, width: 600, height: 320)
+  let before = root.convert(content, from: surface)
+  surface.frame.origin = CGPoint(x: 250, y: 150)
+  let after = root.convert(content, from: surface)
+  check(
+    after.minX - before.minX == 150 && after.minY - before.minY == 70,
+    "reopening computes current card position after canvas pan or drag")
+  surface.frame = CGRect(x: -100, y: -50, width: 300, height: 200)
+  surface.bounds = CGRect(x: 0, y: 0, width: 600, height: 400)
+  let clipped = root.convert(content, from: surface).intersection(root.bounds)
+  check(
+    clipped == CGRect(x: 0, y: 0, width: 200, height: 136),
+    "zoomed partial native area clips to the current viewport")
+  let valid = CGRect(x: 200, y: 100, width: 400, height: 300)
+  check(
+    browserLargestNativeFrame(
+      candidates: [CGRect(x: -1000, y: 0, width: 1200, height: 500), valid],
+      displays: [CGRect(x: 0, y: 0, width: 1200, height: 800)]) == valid,
+    "largest pre-clipped sliver cannot hide a valid native target")
+  check(
+    browserLargestNativeFrame(
+      candidates: [CGRect(x: 0, y: 0, width: 800, height: 300)],
+      displays: [CGRect(x: 0, y: 0, width: 300, height: 800)]) == nil,
+    "minimum size applies after display clipping")
+  let secondary = CGRect(x: -1400, y: -700, width: 800, height: 500)
+  check(
+    nativeAXFrame(fromAppKit: secondary, primaryScreenMaxY: 900)
+      == CGRect(x: -1400, y: 1100, width: 800, height: 500),
+    "negative secondary-monitor origin converts using the primary display")
+}
+MainActor.assumeIsolated {
+  let applications = [
+    NativeWindowApplication(id: 100, appName: "Chrome", suggested: true, launchDate: nil),
+    NativeWindowApplication(id: 200, appName: "Chrome", suggested: false, launchDate: nil),
+    NativeWindowApplication(id: 300, appName: "Finder", suggested: false, launchDate: nil),
+  ]
+  check(
+    browserNativeApplicationLabels(applications)
+      == ["Chrome · PID 100 · recent", "Chrome · PID 200", "Finder"],
+    "only duplicate application labels include a process identifier")
+  let choices = [
+    NativeWindowChoice(
+      id: UUID(), appName: "Chrome", title: "Same", pid: 100,
+      frame: CGRect(x: 10, y: 20, width: 800, height: 600), launchDate: nil),
+    NativeWindowChoice(
+      id: UUID(), appName: "Chrome", title: "Same", pid: 100,
+      frame: CGRect(x: -900, y: 40, width: 700, height: 500), launchDate: nil),
+    NativeWindowChoice(
+      id: UUID(), appName: "Chrome", title: "Unique", pid: 100,
+      frame: CGRect(x: 20, y: 40, width: 600, height: 400), launchDate: nil),
+  ]
+  check(
+    browserNativeWindowLabels(choices)
+      == ["Same · 10,20 · 800×600", "Same · -900,40 · 700×500", "Unique"],
+    "only duplicate window titles include their native geometry")
+  check(
+    browserNativeWindowLabels([choices[0], choices[0]])
+      == ["Same · 10,20 · 800×600 · #1", "Same · 10,20 · 800×600 · #2"],
+    "same-title same-frame windows remain distinct in the chooser")
+}
+print("PASS: \(checks) capture/native geometry and chooser checks")

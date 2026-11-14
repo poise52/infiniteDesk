@@ -37,6 +37,13 @@ unsafe extern "C" {
     );
     fn desk_browser_set_selected(handle: *mut c_void, selected: u8);
     fn desk_browser_destroy(handle: *mut c_void);
+    safe fn desk_browser_finish_native_windows() -> u8;
+}
+
+pub fn restore_windows_before_exit() {
+    if desk_browser_finish_native_windows() == 0 {
+        tracing::warn!("could not confirm restoration of all native window frames");
+    }
 }
 
 pub fn is_bundle_demo() -> bool {
@@ -64,7 +71,7 @@ fn card(id: u64) -> Result<Card> {
         1 => 20.0,
         _ => 620.0,
     };
-    let title = format!("Card {} · N: up to 3 cards", id + 1);
+    let title = format!("Window {} · N: add card", id + 1);
     Ok(Card::new(
         WindowId(id),
         title,
@@ -97,8 +104,7 @@ impl Browser {
         };
         // SAFETY: winit supplies a live NSView on the main thread. The Arc keeps its
         // window alive until the browser is detached in Drop.
-        let browser =
-            unsafe { desk_browser_create_card(handle.ns_view.as_ptr(), id.0, u8::from(id.0 == 0)) };
+        let browser = unsafe { desk_browser_create_card(handle.ns_view.as_ptr(), id.0, 0) };
         let handle = NonNull::new(browser).context("failed to create native browser")?;
         Ok(Self {
             id,

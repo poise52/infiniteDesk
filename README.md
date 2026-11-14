@@ -1,6 +1,6 @@
 # InfiniteDesk
 
-InfiniteDesk is a native macOS canvas. Each card can show a WebKit browser or a live view of a window you select. The command-line demo renders a deterministic scene of virtual windows for navigation and performance tests.
+InfiniteDesk is a native macOS canvas. A card can position a real application window on the desktop, host an embedded WebKit browser or show an optional live preview. The command-line demo renders a deterministic scene of virtual windows for navigation and performance tests.
 
 ## Requirements
 
@@ -12,19 +12,36 @@ The deployment target is macOS 15.0; graphical behavior has been tested on macOS
 
 ## Run and verify
 
-On an Apple Silicon Mac, run `./scripts/build-macos-app.sh` and open
-`target/InfiniteDesk.app` in Finder. Two cards open side by side. The first
-loads Wikipedia; enter a URL and press Return to visit another site. In the
-second card, choose **Web** to open a browser or **Window…** to show an
-existing macOS window. The embedded browser does not import Safari or Chrome
-tabs and needs no Screen Recording or Accessibility permission.
+Build with `./scripts/build-macos-app.sh` and open `target/InfiniteDesk.app`.
+Two empty cards open side by side. Click **Use real window…** in a card,
+choose a running app and select its window. With Accessibility access,
+InfiniteDesk places the original window over the card and gives it focus.
+Type, click, scroll and use shortcuts in the application normally. This
+mode does not require screen sharing.
 
+Click an exposed part of the board or use ⌘Tab to return. You can drag
+the card or pan the board, then click **Work in window** or press ⌘Return
+with that card selected to place the window at the new location. The app
+keeps its own title bar, and its minimum size can extend past the card.
+**Restore** returns the window to its previous size and position and
+detaches it after confirmation. An application can constrain resizing or
+reject a position outside the usable screen. Normal quit also attempts to
+restore attached windows. Card assignments last for the current session.
+
+In the macOS GUI check, two windows belonging to one Chrome process were
+placed on separate cards at 516 × 375 points. After a camera reset,
+⌘Return placed the selected window at 554 × 403 and the other retained its
+frame. In Finder, a file rename and a scroll through a 100-file folder worked
+in the original window. Finder retained a larger size than requested.
+Returning to the board shows a labeled card for each attached window.
+
+**Web** opens an embedded WebKit browser with its own address bar.
 Drag a title bar to move a card and bring it to the front. Press Escape in
 the browser to return the keyboard to the board. With the board focused,
 press N to add a third card, Tab to cycle selection, or Enter to center it.
 For the 1,000-window synthetic scene, use the `--demo` command below.
 
-**Window…** uses the macOS sharing picker. **Web** stops capture only in
+**Preview…** uses the macOS sharing picker. **Web** stops capture only in
 that card. Each capture is limited to 15 frames per second and 1600 × 1200
 pixels. On macOS 15.2 or later, **Focus window** or ⌘Return with a captured
 card selected asks macOS to bring the original window forward. This requires
@@ -33,14 +50,20 @@ uniquely. **Open app** activates the source application without choosing
 between its windows. By default, clicking the live image focuses its source window.
 
 To edit an ordinary text field in a captured Google Chrome window, select
-the card by its title bar, choose **Pick field**, and click inside the field
-in the live preview. **Text…** uses the field already focused in Chrome.
+the card by its title bar, choose **More… → Pick Chrome field…**, and click inside the field
+in the live preview. **More… → Replace focused Chrome field…** uses the field already focused in Chrome.
 Check the field name in the board form, enter the replacement, and choose
 **Replace**. Escape cancels. Both commands replace the entire value and
 require Accessibility access. The board checks the window and field again
 before sending. If another Chrome window covers the field in desktop
 coordinates, point selection can be unavailable. The command excludes
 the address bar and password fields.
+
+Run `native/macos/Browser/Tests/Native/run.sh` for placement geometry.
+With a graphical session and Accessibility access for the test host, add
+`--integration` to exercise exact window selection, resizing and restoration.
+The [native input fixture](native/macos/Browser/Tests/Focus/Fixture/README.md)
+provides two windows for checking clicks, scrolling and keyboard input.
 
 Run `native/macos/Browser/Tests/run.sh` in a graphical macOS session to check
 two independent capture streams. `native/macos/Browser/Tests/Focus/run.sh`

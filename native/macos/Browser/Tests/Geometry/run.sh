@@ -10,6 +10,7 @@ xcrun swiftc -swift-version 6 -warnings-as-errors -target "$arch-apple-macosx15.
   "$root/native/macos/Browser/Browser.swift" \
   "$root/native/macos/Browser/WindowCapture.swift" \
   "$root/native/macos/Browser/WindowFocus.swift" \
+  "$root/native/macos/Browser/NativeWindowPlacement.swift" \
   "$root/native/macos/Browser/BrowserTextInput.swift" \
   "$root/native/macos/Browser/Shortcut.swift" \
   "$root/native/macos/Browser/PickerCoordinator.swift" \

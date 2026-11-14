@@ -21,7 +21,7 @@ it is not a network isolation guarantee.
    Each target field requests initial focus via HTML `autofocus` on a fresh page
    load; focus may depend on Chrome and macOS. If they did not open as separate
    windows, stop; the test setup has failed.
-3. In InfiniteDesk, use **Window…** on separate board cards and select Chrome A
+3. In InfiniteDesk, use **Preview…** on separate board cards and select Chrome A
    and Chrome B respectively in the macOS picker. Confirm each live preview
    shows the matching page. If necessary, use `N` to add a card. Leave both
    windows open throughout the test.
@@ -51,7 +51,7 @@ in the focus test would invalidate the initial **TARGET NOT EDITED** check.
 Record the marker and target/decoy values in both cards before sending.
 
 1. With **Chrome A** in front, click **Target text**. Return to InfiniteDesk,
-   select the title bar of its card, and click **Text…**. Check that the
+   select the title bar of its card, and click **More… → Replace focused Chrome field…**. Check that the
    identified field is the target. Type `desk-A-проверка` into the board's
    replacement field and choose **Replace**.
 2. Keep InfiniteDesk in front. In the live preview check both the editable
@@ -76,7 +76,7 @@ prove Chrome delivered an input event to the page.
    **Target text** field on the original page once to establish initial focus.
    Leave the decoys untouched.
 2. Return to InfiniteDesk and keep it frontmost for the rest of the test.
-   Select card A by its title bar. At reduced board zoom, click **Pick field**
+   Select card A by its title bar. At reduced board zoom, click **More… → Pick Chrome field…**
    and then click inside the **Neutral decoy** input in the live image.
    Confirm the replacement form names the decoy and both counters still read
    zero. Enter `picked-A-проверка` into the board form and click **Replace**.
@@ -89,7 +89,7 @@ prove Chrome delivered an input event to the page.
    unfocused decoy with `picked-B-проверка`. Verify its decoy counter
    increased, its target value and counter stayed unchanged, and A retained
    its result. Record the zooms and the before/after counters for both cards.
-5. Arm **Pick field** and click the page heading. Verify no replacement form
+5. Arm **More… → Pick Chrome field…** and click the page heading. Verify no replacement form
    opens. Arm the picker again and press Escape. Pick another field, then
    switch cards before choosing **Replace**. Confirm the form disappears and
    the four values and counters stay unchanged.

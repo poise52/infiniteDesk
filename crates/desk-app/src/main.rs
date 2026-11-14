@@ -474,6 +474,14 @@ impl ApplicationHandler<GpuError> for App {
         event_loop.exit();
     }
 
+    #[cfg(all(target_os = "macos", feature = "native-browser"))]
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.browser_mode == browser::Mode::Browser {
+            self.browsers.clear();
+            browser::restore_windows_before_exit();
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if let Some(benchmark) = &mut self.benchmark

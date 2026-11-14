@@ -27,6 +27,71 @@ func browserVisibleGeometry(
   return (visible, bounds)
 }
 
+func browserRectArea(_ rect: CGRect) -> CGFloat {
+  rect.isNull || rect.isEmpty ? 0 : rect.width * rect.height
+}
+
+func browserUncoveredRectangles(_ rectangle: CGRect, occluders: [CGRect]) -> [CGRect] {
+  guard !rectangle.isNull, !rectangle.isEmpty else { return [] }
+  return occluders.reduce([rectangle]) { remaining, blocker in
+    remaining.flatMap { rect -> [CGRect] in
+      let overlap = rect.intersection(blocker)
+      guard !overlap.isNull, !overlap.isEmpty else { return [rect] }
+      return [
+        CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: overlap.minY - rect.minY),
+        CGRect(x: rect.minX, y: overlap.maxY, width: rect.width, height: rect.maxY - overlap.maxY),
+        CGRect(
+          x: rect.minX, y: overlap.minY, width: overlap.minX - rect.minX, height: overlap.height),
+        CGRect(
+          x: overlap.maxX, y: overlap.minY, width: rect.maxX - overlap.maxX, height: overlap.height),
+      ].filter { !$0.isEmpty }
+    }
+  }
+}
+
+func browserLargestNativeFrame(candidates: [CGRect], displays: [CGRect]) -> CGRect? {
+  candidates.flatMap { candidate in
+    displays.map { candidate.intersection($0) }.filter {
+      !$0.isNull && $0.width >= 320 && $0.height >= 240
+    }
+  }.max { browserRectArea($0) < browserRectArea($1) }
+}
+
+func browserNativeApplicationLabels(_ applications: [NativeWindowApplication]) -> [String] {
+  let counts = Dictionary(grouping: applications, by: \.appName).mapValues(\.count)
+  return applications.map {
+    $0.appName + (counts[$0.appName, default: 0] > 1 ? " · PID \($0.id)" : "")
+      + ($0.suggested ? " · recent" : "")
+  }
+}
+
+func browserNativeWindowLabels(_ choices: [NativeWindowChoice]) -> [String] {
+  let titles = choices.map { $0.title.isEmpty ? "Untitled window" : $0.title }
+  let counts = Dictionary(grouping: titles, by: { $0 }).mapValues(\.count)
+  let labels = zip(choices, titles).map { choice, title in
+    guard counts[title, default: 0] > 1 else { return title }
+    let frame = choice.frame
+    return title + " · "
+      + String(
+        format: "%.0f,%.0f · %.0f×%.0f",
+        frame.minX, frame.minY, frame.width, frame.height)
+  }
+  let labelCounts = Dictionary(grouping: labels, by: { $0 }).mapValues(\.count)
+  return labels.enumerated().map { index, label in
+    label + (labelCounts[label, default: 0] > 1 ? " · #\(index + 1)" : "")
+  }
+}
+
+private struct NativeApplicationSelection {
+  let application: NativeWindowApplication
+  let generation: UInt64
+}
+
+private struct NativeWindowSelection {
+  let choice: NativeWindowChoice
+  let generation: UInt64
+}
+
 @MainActor private final class BrowserClip: NSView {
   var occluders: [CGRect] = []
   override var isFlipped: Bool { true }
@@ -46,7 +111,14 @@ func browserVisibleGeometry(
 }
 
 @MainActor private final class PreviewView: NSView {
+  var usesTopLeftOrigin = false
+  override var isFlipped: Bool { usesTopLeftOrigin }
   var onClick: ((CGPoint) -> Void)?
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    let hit = super.hitTest(point)
+    guard usesTopLeftOrigin, let hit, !(hit is NSButton) else { return hit }
+    return self
+  }
   var pickingField = false {
     didSet { window?.invalidateCursorRects(for: self) }
   }
@@ -76,11 +148,27 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
   let capture = WindowCapture()
   let preview = PreviewView()
   let chooseWindow = NSButton(title: "Window…", target: nil, action: nil)
+  let choosePreview = NSButton(title: "Preview…", target: nil, action: nil)
+  let useRealWindow = NSButton(title: "Use real window…", target: nil, action: nil)
+  let workInWindow = NSButton(title: "Work in window", target: nil, action: nil)
+  let restoreWindow = NSButton(title: "Restore", target: nil, action: nil)
+  let nativeSurface = PreviewView()
+  let nativeTitle = NSTextField(labelWithString: "Work in the original macOS window")
+  let nativeHelp = NSTextField(
+    wrappingLabelWithString:
+      "Choose an app and window. InfiniteDesk places the original here; typing and shortcuts stay native.\n\nReturn: click exposed canvas or title, or use Cmd+Tab. Resume: click this card or press Cmd+Return. Restore returns the original size and position."
+  )
+  let nativeClient = NativeWindowClient()
+  var nativeChoice: NativeWindowChoice?
+  var nativeBusy = false
+  var nativeChooserGeneration: UInt64 = 0
+  var destroyed = false
+  var nativeContextObserver: NSObjectProtocol?
+  var cardSize = CGSize.zero
   let returnToWeb = NSButton(title: "Web", target: nil, action: nil)
   let openApp = NSButton(title: "Open app", target: nil, action: nil)
   let focusWindow = NSButton(title: "Focus window", target: nil, action: nil)
-  let textMode = NSButton(title: "Text…", target: nil, action: nil)
-  let pickField = NSButton(title: "Pick field", target: nil, action: nil)
+  let previewTools = NSButton(title: "More…", target: nil, action: nil)
   let textLabel = NSTextField(labelWithString: "")
   let textEditor = NSTextField()
   let textSend = NSButton(title: "Replace", target: nil, action: nil)
@@ -92,6 +180,11 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
   init(parent: NSView, id: UInt64, startWeb: Bool) {
     self.parent = parent
     super.init()
+    nativeContextObserver = NotificationCenter.default.addObserver(
+      forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+    ) { [weak self] _ in
+      MainActor.assumeIsolated { self?.nativeChooserGeneration &+= 1 }
+    }
     clip.setAccessibilityIdentifier("infinitedesk.card.\(id)")
     clip.wantsLayer = true
     clip.layer?.masksToBounds = true
@@ -115,20 +208,39 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     address.delegate = self
     chooseWindow.target = self
     chooseWindow.action = #selector(selectWindow)
+    choosePreview.target = self
+    choosePreview.action = #selector(selectPreview)
+    choosePreview.setAccessibilityHelp("Share a live preview of a window")
+    useRealWindow.target = self
+    useRealWindow.action = #selector(selectWindow)
+    workInWindow.target = self
+    workInWindow.action = #selector(workInSourceWindow)
+    workInWindow.setAccessibilityHelp(
+      "Place and activate the original window. Shortcut: Command Return")
+    restoreWindow.target = self
+    restoreWindow.action = #selector(restoreSourceWindow)
+    restoreWindow.setAccessibilityHelp("Restore the original window's previous size and position")
+    workInWindow.isHidden = true
+    restoreWindow.isHidden = true
+    nativeSurface.usesTopLeftOrigin = true
+    nativeTitle.font = .systemFont(ofSize: 19, weight: .semibold)
+    nativeHelp.textColor = .secondaryLabelColor
+    nativeSurface.onClick = { [weak self] _ in
+      guard self?.nativeChoice != nil else { return }
+      self?.workInSourceWindow()
+    }
+    nativeSurface.addSubview(nativeTitle)
+    nativeSurface.addSubview(nativeHelp)
+    nativeSurface.addSubview(useRealWindow)
     returnToWeb.target = self
     returnToWeb.action = #selector(showWeb)
     openApp.target = self
     openApp.action = #selector(openSourceApplication)
     focusWindow.target = self
     focusWindow.action = #selector(focusSourceWindow)
-    textMode.target = self
-    textMode.action = #selector(beginTextMode)
-    pickField.target = self
-    pickField.action = #selector(toggleFieldPicking)
-    pickField.setAccessibilityLabel("Pick a Chrome page field from the preview")
-    pickField.setAccessibilityHelp(
-      "Arm field selection, then click a field in the preview. Escape cancels.")
-    textMode.setAccessibilityHelp("Select Chrome's currently focused editable page field")
+    previewTools.target = self
+    previewTools.action = #selector(showPreviewTools)
+    previewTools.isHidden = true
     textSend.target = self
     textSend.action = #selector(sendTextValue)
     textEditor.placeholderString = "Replacement text"
@@ -138,8 +250,6 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     textLabel.isHidden = true
     textEditor.isHidden = true
     textSend.isHidden = true
-    textMode.isHidden = true
-    pickField.isHidden = true
     preview.onClick = { [weak self] point in
       guard let self else { return }
       if self.preview.pickingField {
@@ -160,8 +270,6 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
       self.status.stringValue =
         "Capture changed or became unavailable; choose a field after the preview resumes."
       self.status.isHidden = false
-      self.pickField.isEnabled = false
-      self.textMode.isEnabled = false
     }
     capture.onUpdate = { [weak self] message, started in
       guard let self else { return }
@@ -169,12 +277,10 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
       self.status.isHidden = false
       self.openApp.isEnabled = self.capture.canOpenApplication
       self.focusWindow.isEnabled = self.capture.canFocusWindow
-      self.textMode.isHidden = !self.capture.canFocusWindow || self.capture.textTarget == nil
-      self.pickField.isHidden = self.textMode.isHidden
-      self.pickField.isEnabled = self.capture.canFocusWindow
-      self.textMode.isEnabled = self.capture.canFocusWindow
+      self.previewTools.isHidden = !self.capture.canFocusWindow || self.capture.textTarget == nil
       self.closeTextMode()
       if started {
+        self.nativeSurface.isHidden = true
         self.webView?.isHidden = true
         self.preview.isHidden = false
         self.back.isHidden = true
@@ -192,12 +298,15 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     surface.addSubview(address)
     surface.addSubview(preview)
     surface.addSubview(chooseWindow)
+    surface.addSubview(choosePreview)
+    surface.addSubview(nativeSurface)
+    surface.addSubview(workInWindow)
+    surface.addSubview(restoreWindow)
     surface.addSubview(returnToWeb)
     surface.addSubview(openApp)
     surface.addSubview(focusWindow)
     surface.addSubview(status)
-    surface.addSubview(textMode)
-    surface.addSubview(pickField)
+    surface.addSubview(previewTools)
     surface.addSubview(textLabel)
     surface.addSubview(textEditor)
     surface.addSubview(textSend)
@@ -209,8 +318,15 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
         }
         if routeFocusShortcut(
           keyCode: event.keyCode, modifiers: event.modifierFlags,
-          isRepeat: event.isARepeat, selected: self.selected && !self.preview.isHidden,
-          focus: { self.focusSourceWindow() })
+          isRepeat: event.isARepeat,
+          selected: self.selected && (self.nativeChoice != nil || !self.preview.isHidden),
+          focus: {
+            if self.nativeChoice != nil {
+              self.workInSourceWindow()
+            } else {
+              self.focusSourceWindow()
+            }
+          })
         {
           return true
         }
@@ -247,7 +363,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
       home.isHidden = true
       address.isHidden = true
       returnToWeb.isHidden = false
-      status.stringValue = "Choose Web or Window…"
+      status.stringValue = "Window… uses Accessibility. Preview… is optional screen sharing."
     }
   }
 
@@ -263,6 +379,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
       clip.isHidden = true
       return
     }
+    cardSize = CGSize(width: width, height: height)
     let parentBounds = parent.bounds
     let clipY = parent.isFlipped ? parentBounds.minY : parentBounds.maxY - viewportHeight
     let clipFrame = NSRect(
@@ -280,13 +397,20 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     setFrame(back, NSRect(x: 6, y: 7, width: 30, height: 30))
     setFrame(forward, NSRect(x: 38, y: 7, width: 30, height: 30))
     setFrame(home, NSRect(x: 70, y: 7, width: 30, height: 30))
-    setFrame(address, NSRect(x: 106, y: 9, width: max(1, width - 220), height: 25))
-    setFrame(chooseWindow, NSRect(x: width - 106, y: 7, width: 100, height: 30))
+    setFrame(address, NSRect(x: 106, y: 9, width: max(1, width - 322), height: 25))
+    setFrame(chooseWindow, NSRect(x: width - 204, y: 7, width: 96, height: 30))
+    setFrame(choosePreview, NSRect(x: width - 104, y: 7, width: 98, height: 30))
+    setFrame(workInWindow, NSRect(x: 80, y: 7, width: 128, height: 30))
+    setFrame(restoreWindow, NSRect(x: 212, y: 7, width: 76, height: 30))
+    setFrame(
+      nativeSurface, NSRect(x: 0, y: chromeHeight, width: width, height: height - chromeHeight))
+    setFrame(nativeTitle, NSRect(x: 24, y: 30, width: max(1, width - 48), height: 28))
+    setFrame(nativeHelp, NSRect(x: 24, y: 72, width: max(1, width - 48), height: 138))
+    setFrame(useRealWindow, NSRect(x: 20, y: 224, width: 174, height: 36))
     setFrame(returnToWeb, NSRect(x: 6, y: 7, width: 70, height: 30))
     setFrame(focusWindow, NSRect(x: 80, y: 7, width: 110, height: 30))
     setFrame(openApp, NSRect(x: 194, y: 7, width: 82, height: 30))
-    setFrame(textMode, NSRect(x: 280, y: 7, width: 62, height: 30))
-    setFrame(pickField, NSRect(x: 346, y: 7, width: 94, height: 30))
+    setFrame(previewTools, NSRect(x: 280, y: 7, width: 64, height: 30))
     setFrame(textLabel, NSRect(x: 8, y: chromeHeight + 6, width: max(1, width - 16), height: 18))
     setFrame(textEditor, NSRect(x: 8, y: chromeHeight + 28, width: max(1, width - 90), height: 25))
     setFrame(textSend, NSRect(x: width - 78, y: chromeHeight + 26, width: 70, height: 30))
@@ -308,23 +432,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
   }
 
   func updateMask() {
-    var remaining = [clip.bounds]
-    for blocker in clip.occluders {
-      remaining = remaining.flatMap { rect -> [CGRect] in
-        let overlap = rect.intersection(blocker)
-        guard !overlap.isNull, !overlap.isEmpty else { return [rect] }
-        return [
-          CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: overlap.minY - rect.minY),
-          CGRect(
-            x: rect.minX, y: overlap.maxY, width: rect.width, height: rect.maxY - overlap.maxY),
-          CGRect(
-            x: rect.minX, y: overlap.minY, width: overlap.minX - rect.minX, height: overlap.height),
-          CGRect(
-            x: overlap.maxX, y: overlap.minY, width: rect.maxX - overlap.maxX,
-            height: overlap.height),
-        ].filter { !$0.isEmpty }
-      }
-    }
+    let remaining = browserUncoveredRectangles(clip.bounds, occluders: clip.occluders)
     let path = CGMutablePath()
     for rect in remaining { path.addRect(clip.convertToLayer(rect)) }
     CATransaction.begin()
@@ -339,8 +447,6 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     capture.textGate?.cancel()
     capture.textGate = nil
     preview.pickingField = false
-    pickField.title = "Pick field"
-    pickField.state = .off
     if let editor = textEditor.currentEditor(), parent.window?.firstResponder === editor {
       parent.window?.makeFirstResponder(parent)
     }
@@ -385,6 +491,24 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     return true
   }
 
+  @objc func showPreviewTools() {
+    let menu = NSMenu(title: "Preview tools")
+    let focused = NSMenuItem(
+      title: "Replace focused Chrome field…",
+      action: #selector(beginTextMode), keyEquivalent: "")
+    focused.target = self
+    focused.isEnabled = capture.canFocusWindow && capture.textTarget != nil
+    menu.addItem(focused)
+    let pick = NSMenuItem(
+      title: preview.pickingField ? "Cancel field selection" : "Pick Chrome field…",
+      action: #selector(toggleFieldPicking), keyEquivalent: "")
+    pick.target = self
+    pick.isEnabled = focused.isEnabled
+    menu.addItem(pick)
+    menu.popUp(
+      positioning: nil, at: CGPoint(x: previewTools.frame.minX, y: chromeHeight), in: surface)
+  }
+
   @objc func toggleFieldPicking() {
     if preview.pickingField {
       closeTextMode()
@@ -395,8 +519,6 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     capture.cancelPendingFocus()
     closeTextMode()
     preview.pickingField = true
-    pickField.title = "Cancel pick"
-    pickField.state = .on
     parent.window?.makeFirstResponder(preview)
     status.stringValue = "Click an ordinary Chrome page field in the preview. Escape cancels."
     status.isHidden = false
@@ -412,7 +534,8 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
         point, in: preview.bounds, flipped: preview.isFlipped)
     else {
       closeTextMode()
-      status.stringValue = "No captured field at that point; choose Pick field and retry."
+      status.stringValue =
+        "Click inside the captured window after choosing More… → Pick Chrome field…."
       status.isHidden = false
       return
     }
@@ -498,7 +621,203 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
       self.status.isHidden = false
     }
   }
+  func nativeStatus(_ message: String) {
+    status.stringValue = message
+    status.isHidden = false
+  }
+
+  func nativeChooserIsCurrent(_ generation: UInt64) -> Bool {
+    !destroyed && nativeChooserGeneration == generation && !clip.isHidden
+      && NSApp.isActive && parent.window?.isKeyWindow == true
+  }
+
   @objc func selectWindow() {
+    guard !nativeBusy, !destroyed else { return }
+    nativeChooserGeneration &+= 1
+    let generation = nativeChooserGeneration
+    closeTextMode()
+    let menu = NSMenu(title: "Use a real window")
+    let applications = nativeClient.applications()
+    for (application, title) in zip(applications, browserNativeApplicationLabels(applications)) {
+      let item = NSMenuItem(
+        title: title,
+        action: #selector(selectNativeApplication(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = NativeApplicationSelection(
+        application: application, generation: generation)
+      menu.addItem(item)
+    }
+    if menu.items.isEmpty {
+      nativeStatus("Open another application with a normal window, then choose Window….")
+      return
+    }
+    menu.popUp(
+      positioning: nil, at: CGPoint(x: chooseWindow.frame.minX, y: chromeHeight), in: surface)
+  }
+
+  @objc func selectNativeApplication(_ sender: NSMenuItem) {
+    guard let selection = sender.representedObject as? NativeApplicationSelection,
+      !nativeBusy, nativeChooserIsCurrent(selection.generation)
+    else { return }
+    let application = selection.application
+    let generation = selection.generation
+    nativeBusy = true
+    nativeStatus("Reading windows in \(application.appName)…")
+    nativeClient.discover(application: application) { [weak self] result in
+      guard let self else { return }
+      self.nativeBusy = false
+      guard self.nativeChooserIsCurrent(generation) else {
+        self.nativeStatus("Window selection cancelled. Choose Window… again.")
+        return
+      }
+      switch result {
+      case .failure(let error): self.nativeStatus(error.localizedDescription)
+      case .success(let choices):
+        guard !choices.isEmpty else {
+          self.nativeStatus(
+            "No movable windows found. Open a normal window in \(application.appName) and retry.")
+          return
+        }
+        let menu = NSMenu(title: application.appName)
+        for (choice, title) in zip(choices, browserNativeWindowLabels(choices)) {
+          let item = NSMenuItem(
+            title: title,
+            action: #selector(self.selectNativeChoice(_:)), keyEquivalent: "")
+          item.target = self
+          item.representedObject = NativeWindowSelection(choice: choice, generation: generation)
+          menu.addItem(item)
+        }
+        self.nativeStatus("Choose the exact window to work in.")
+        menu.popUp(
+          positioning: nil,
+          at: CGPoint(x: self.chooseWindow.frame.minX, y: self.chromeHeight), in: self.surface)
+      }
+    }
+  }
+
+  @objc func selectNativeChoice(_ sender: NSMenuItem) {
+    guard let selection = sender.representedObject as? NativeWindowSelection,
+      !nativeBusy, nativeChooserIsCurrent(selection.generation)
+    else { return }
+    let choice = selection.choice
+    let generation = selection.generation
+    if nativeChoice != nil {
+      nativeBusy = true
+      nativeClient.restore { [weak self] result in
+        guard let self else { return }
+        self.nativeBusy = false
+        switch result {
+        case .failure(let error): self.nativeStatus(error.localizedDescription)
+        case .success:
+          self.nativeChoice = nil
+          self.showNativeSurface()
+          guard self.nativeChooserIsCurrent(generation) else {
+            self.nativeStatus("Window selection cancelled. Previous window restored.")
+            return
+          }
+          self.nativeChooserGeneration &+= 1
+          self.placeNativeWindow(choice)
+        }
+      }
+    } else {
+      nativeChooserGeneration &+= 1
+      placeNativeWindow(choice)
+    }
+  }
+
+  func nativeTargetFrame() -> CGRect? {
+    guard !clip.isHidden, let window = parent.window, let primary = NSScreen.screens.first else {
+      return nil
+    }
+    let content = CGRect(
+      x: 0, y: chromeHeight + 8,
+      width: cardSize.width, height: cardSize.height - chromeHeight - 40)
+    let inClip = clip.convert(content, from: surface).intersection(surface.frame).intersection(
+      clip.bounds)
+    let available = browserUncoveredRectangles(inClip, occluders: clip.occluders)
+    let candidates = available.map { window.convertToScreen(clip.convert($0, to: nil)) }
+    guard
+      let visible = browserLargestNativeFrame(
+        candidates: candidates,
+        displays: NSScreen.screens.map(\.visibleFrame))
+    else { return nil }
+    return nativeAXFrame(fromAppKit: visible, primaryScreenMaxY: primary.frame.maxY)
+  }
+
+  func showNativeSurface() {
+    closeTextMode()
+    capture.stop()
+    webView?.isHidden = true
+    preview.isHidden = true
+    nativeSurface.isHidden = false
+    for view in [
+      back, forward, home, address, openApp, focusWindow, previewTools,
+    ] {
+      view.isHidden = true
+    }
+    returnToWeb.isHidden = false
+    workInWindow.isHidden = nativeChoice == nil
+    restoreWindow.isHidden = nativeChoice == nil
+    nativeTitle.stringValue =
+      nativeChoice.map { "\($0.appName) · \($0.title)" }
+      ?? "Work in the original macOS window"
+    useRealWindow.title = nativeChoice == nil ? "Use real window…" : "Choose another window…"
+  }
+
+  func placeNativeWindow(_ choice: NativeWindowChoice) {
+    guard !nativeBusy else { return }
+    guard let frame = nativeTargetFrame() else {
+      nativeStatus("Enlarge or zoom into this card: a visible 320 × 240 point area is required.")
+      return
+    }
+    nativeChoice = choice
+    showNativeSurface()
+    nativeBusy = true
+    nativeStatus("Placing the original \(choice.appName) window…")
+    nativeClient.place(choice: choice, frame: frame) { [weak self] result in
+      guard let self else { return }
+      self.nativeBusy = false
+      switch result {
+      case .failure(let error): self.nativeStatus(error.localizedDescription)
+      case .success(let placement):
+        self.nativeChoice = choice
+        self.showNativeSurface()
+        self.nativeStatus(
+          placement.adjusted
+            ? "App adjusted its minimum size. Return via canvas or Cmd+Tab; Restore returns its frame."
+            : "Original window active. Return via canvas or Cmd+Tab; resume with Cmd+Return.")
+      }
+    }
+  }
+
+  @objc func workInSourceWindow() {
+    guard let nativeChoice else { return }
+    placeNativeWindow(nativeChoice)
+  }
+
+  @objc func restoreSourceWindow() {
+    guard !nativeBusy, nativeChoice != nil else { return }
+    nativeBusy = true
+    nativeClient.restore { [weak self] result in
+      guard let self else { return }
+      self.nativeBusy = false
+      switch result {
+      case .failure(let error): self.nativeStatus(error.localizedDescription)
+      case .success:
+        self.nativeChoice = nil
+        self.showNativeSurface()
+        self.nativeStatus("Original window size and position restored.")
+      }
+    }
+  }
+
+  @objc func selectPreview() {
+    guard !nativeBusy else { return }
+    nativeChooserGeneration &+= 1
+    if nativeChoice != nil {
+      nativeStatus("Restore the real window before starting an optional preview.")
+      return
+    }
     closeTextMode(reason: "Text operation cancelled while choosing another captured window.")
     capture.selectWindow()
   }
@@ -519,9 +838,17 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     }
   }
   @objc func showWeb() {
+    guard !nativeBusy else { return }
+    nativeChooserGeneration &+= 1
+    if nativeChoice != nil {
+      nativeStatus("Restore the real window before switching this card to Web.")
+      return
+    }
+    nativeSurface.isHidden = true
+    previewTools.isHidden = true
+    workInWindow.isHidden = true
+    restoreWindow.isHidden = true
     closeTextMode()
-    textMode.isHidden = true
-    pickField.isHidden = true
     capture.stop()
     let isNew = webView == nil
     if isNew {
@@ -611,8 +938,15 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     return nil
   }
   func destroy() {
+    destroyed = true
+    nativeChooserGeneration &+= 1
+    if let nativeContextObserver {
+      NotificationCenter.default.removeObserver(nativeContextObserver)
+    }
+    nativeContextObserver = nil
     closeTextMode()
     capture.destroy()
+    nativeClient.close()
     if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
     escapeMonitor = nil
     webView?.stopLoading()
@@ -680,6 +1014,7 @@ public func deskBrowserSetSelected(_ pointer: UnsafeMutableRawPointer?, _ select
     guard let raw = UnsafeMutableRawPointer(bitPattern: address) else { return }
     let browser = Unmanaged<Browser>.fromOpaque(raw).takeUnretainedValue()
     if browser.selected && selected != 1 {
+      browser.nativeChooserGeneration &+= 1
       browser.closeTextMode(reason: "Text operation cancelled: this card is no longer selected.")
       browser.capture.cancelPendingFocus()
     }
