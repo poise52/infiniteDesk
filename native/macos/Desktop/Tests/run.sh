@@ -9,5 +9,8 @@ xcrun swiftc -swift-version 6 -warnings-as-errors -target "$arch-apple-macosx15.
   -module-cache-path "$build/module-cache" \
   "$root/native/macos/Desktop/DesktopWindows.swift" \
   "$root/native/macos/Desktop/DesktopObservation.swift" \
+  "$root"/native/macos/Desktop/DesktopCamera*.swift \
   "$root/native/macos/Desktop/Tests/main.swift" -o "$build/desktop-window-tests"
-exec "$build/desktop-window-tests"
+"$build/desktop-window-tests"
+"$root/native/macos/Desktop/Tests/Camera/run.sh"
+exec "$root/native/macos/Desktop/Tests/Recovery/run.sh"

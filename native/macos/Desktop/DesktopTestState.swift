@@ -24,6 +24,8 @@ final class DesktopTestState: @unchecked Sendable {
     let availability: String
     let originalFrame: Frame
     let worldFrame: Frame
+    let page: Int
+    let parked: Bool
 
     init(_ window: DesktopWindow) {
       id = window.id
@@ -36,28 +38,58 @@ final class DesktopTestState: @unchecked Sendable {
       }
       originalFrame = Frame(window.originalFrame)
       worldFrame = Frame(window.worldFrame)
+      page = window.cameraPage
+      parked = window.managerMinimized
+    }
+  }
+
+  private struct Camera: Encodable, Sendable {
+    let x: Double
+    let y: Double
+    let page: Int
+    let paused: Bool
+    let busy: Bool
+    let pendingRecoveryCount: Int
+    let detail: String?
+
+    init(_ camera: DesktopCameraSnapshot, busy: Bool) {
+      x = camera.origin.x
+      y = camera.origin.y
+      page = camera.page
+      paused = camera.paused
+      self.busy = busy
+      pendingRecoveryCount = camera.recoveryCount
+      detail = camera.detail
     }
   }
 
   private struct Output: Encodable {
+    let managerPID: Int32
+    let testSession: String?
     let windows: [Window]
     let focusedID: UUID?
+    let camera: Camera
   }
 
   private struct Snapshot: Sendable {
     let windows: [DesktopWindow]
     let focusedID: UUID?
+    let camera: Camera
   }
 
   private static let logger = Logger(subsystem: "dev.infinitedesk.desktop", category: "test-state")
   private let fileURL: URL
+  private let testSession: String?
   private let queue = DispatchQueue(label: "dev.infinitedesk.desktop-test-state", qos: .utility)
   private let lock = NSLock()
   private var pending: Snapshot?
   private var draining = false
   private var stopped = false
 
-  private init(fileURL: URL) { self.fileURL = fileURL }
+  private init(fileURL: URL, testSession: String?) {
+    self.fileURL = fileURL
+    self.testSession = testSession
+  }
 
   static func configured(environment: [String: String] = ProcessInfo.processInfo.environment) -> DesktopTestState? {
     guard let path = environment["INFINITEDESK_TEST_STATE_PATH"], !path.isEmpty else { return nil }
@@ -65,11 +97,15 @@ final class DesktopTestState: @unchecked Sendable {
       logger.error("Test snapshot export disabled: INFINITEDESK_TEST_STATE_PATH must be absolute.")
       return nil
     }
-    return DesktopTestState(fileURL: URL(fileURLWithPath: path).standardizedFileURL)
+    return DesktopTestState(
+      fileURL: URL(fileURLWithPath: path).standardizedFileURL,
+      testSession: environment["INFINITEDESK_TEST_SESSION"])
   }
 
-  func publish(windows: [DesktopWindow], focusedID: UUID?) {
-    let snapshot = Snapshot(windows: windows, focusedID: focusedID)
+  func publish(
+    windows: [DesktopWindow], focusedID: UUID?, camera: DesktopCameraSnapshot, busy: Bool
+  ) {
+    let snapshot = Snapshot(windows: windows, focusedID: focusedID, camera: Camera(camera, busy: busy))
     lock.lock()
     guard !stopped else { lock.unlock(); return }
     pending = snapshot
@@ -101,7 +137,9 @@ final class DesktopTestState: @unchecked Sendable {
       do {
         try FileManager.default.createDirectory(
           at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let output = Output(windows: snapshot.windows.map(Window.init), focusedID: snapshot.focusedID)
+        let output = Output(
+          managerPID: ProcessInfo.processInfo.processIdentifier, testSession: testSession,
+          windows: snapshot.windows.map(Window.init), focusedID: snapshot.focusedID, camera: snapshot.camera)
         try encoder.encode(output).write(to: fileURL, options: .atomic)
       } catch {
         let failure = error as NSError

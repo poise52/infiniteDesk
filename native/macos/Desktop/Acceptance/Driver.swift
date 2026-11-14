@@ -56,6 +56,17 @@ func frameJSON(_ frame: CGRect) -> [String: Double] {
   ["x": frame.minX, "y": frame.minY, "width": frame.width, "height": frame.height]
 }
 
+func visibleIDs(_ pid: pid_t) throws -> Set<CGWindowID> {
+  guard let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
+    throw Failure.message("Cannot read visible windows")
+  }
+  return Set(list.compactMap {
+    guard ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+      ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0 else { return nil }
+    return ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+  })
+}
+
 struct Window {
   let id: CGWindowID
   let element: AXUIElement
@@ -336,6 +347,11 @@ func launchContext() -> [String: Any] {
                 "launchContext": launchContext()])
     return
   }
+  if ["manager-identity", "manager-quit", "manager-kill"].contains(command) {
+    guard args.count == 5, let pid = pid_t(args[1]) else { throw Failure.message("Invalid test manager request") }
+    try output(testManager(command: command, pid: pid, session: args[2], statePath: args[3], journalPath: args[4]))
+    return
+  }
   if command == "finder-snapshot" {
     try output(["windows": try finderSnapshot()])
     return
@@ -348,9 +364,12 @@ func launchContext() -> [String: Any] {
   _ = AXUIElementSetMessagingTimeout(app, 0.3)
   var current = try windows(pid, app: app)
   if command == "snapshot" {
+    let visible = try visibleIDs(pid)
     try output(["pid": pid, "frontmostPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
                 "focusedID": focusedID(app, windows: current).map { Int($0) } ?? NSNull(),
-                "windows": current.map { ["id": $0.id, "title": $0.title, "frame": frameJSON($0.frame)] as [String: Any] }])
+                "onscreenIDs": visible.sorted(), "displayWidth": CGDisplayBounds(CGMainDisplayID()).width,
+                "windows": current.map { ["id": $0.id, "title": $0.title, "frame": frameJSON($0.frame),
+                  "minimized": attribute($0.element, kAXMinimizedAttribute) ?? NSNull()] as [String: Any] }])
     return
   }
   guard args.count >= 3, let id = CGWindowID(args[2]),
@@ -382,7 +401,8 @@ func launchContext() -> [String: Any] {
   guard args.count == 4 else { throw Failure.message("Expected command payload") }
   switch command {
   case "shortcut":
-    let codes: [String: CGKeyCode] = ["register": 13, "left": 123, "right": 124]
+    let codes: [String: CGKeyCode] = ["register": 13, "left": 123, "right": 124,
+      "newPage": 45, "pageLeft": 33, "pageRight": 30, "togglePause": 35]
     guard let code = codes[args[3]] else { throw Failure.message("Unknown shortcut") }
     try postKey(code, flags: [.maskControl, .maskAlternate, .maskCommand])
   case "type":

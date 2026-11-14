@@ -251,3 +251,40 @@ native focus and input results. Minimum-size and Finder observations retain
 their separate statuses. A requested stage-2 failure makes the run fail. No live
 stage-2 result is implied by `--check`, which compiles/signs the driver and runs
 only the pure model and work-area guard tests.
+
+## Stage 3: moving between desktop pages
+
+The camera test runs on one display and one ordinary macOS Space. It registers
+two windows with identical titles in the disposable Chrome profile. It moves B
+one page right, verifies a manual drag at a nonzero camera origin and types into
+both originals after switching. It checks the native Chrome window state, the
+on-screen Core Graphics window IDs, world coordinates, and a separate recovery
+journal. The Finder window, when present, must keep its native bounds.
+
+Run each mode with a fresh manager and a fresh directory. Quit the development
+manager normally before starting. Keep the mouse and keyboard free while the
+two fixture windows are open. The normal product grant and the temporary driver
+grant are the same as for stage 2.
+
+```sh
+camera_dir=$(mktemp -d "${TMPDIR:-/tmp}/infinitedesk-camera.XXXXXXXX")
+camera_dir=$(cd "$camera_dir" && pwd -P)
+export INFINITEDESK_TEST_STATE_PATH="$camera_dir/model.json"
+export INFINITEDESK_TEST_CAMERA_JOURNAL_PATH="$camera_dir/journal.json"
+export INFINITEDESK_TEST_SESSION=$(uuidgen)
+open -n -g --env "INFINITEDESK_TEST_STATE_PATH=$INFINITEDESK_TEST_STATE_PATH" \
+  --env "INFINITEDESK_TEST_CAMERA_JOURNAL_PATH=$INFINITEDESK_TEST_CAMERA_JOURNAL_PATH" \
+  --env "INFINITEDESK_TEST_SESSION=$INFINITEDESK_TEST_SESSION" target/InfiniteDesk.app
+# Once model.json appears, select quit or crash for this fresh test session.
+INFINITEDESK_TEST_CAMERA_MODE=quit native/macos/Desktop/Acceptance/run.sh --run
+```
+
+In `quit` mode, the signed driver asks the tested app to quit. Both original
+windows must reappear and the journal must clear. In `crash` mode, it interrupts
+only the session-matched development manager and relaunches the same bundle.
+The restarted manager must report the pending window, keep both registrations
+unbound, and leave the parked original alone. The test restores the identified
+disposable Chrome window through its own browser and verifies both frames.
+The recovery record remains available for manual acknowledgement. The test
+uses a private journal for each mode. Its report records the individual checks
+and the state observed independently of the manager.

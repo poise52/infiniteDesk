@@ -3,7 +3,7 @@
 > [!WARNING]
 > **Do not download or install InfiniteDesk.** The project is unfinished. The build instructions below are for development and testing only.
 
-InfiniteDesk is a macOS menu bar app for registering and focusing real application windows. Registration reads the focused window where it is. You can then switch between registered windows, including two windows belonging to the same app. This first desktop mode keeps registrations for the current session. Panning between distant windows and the zoomed-out overview are planned.
+InfiniteDesk is a macOS menu bar app for registering and focusing real application windows. Registration reads the focused window where it is. You can then switch between registered windows, including two windows belonging to the same app. The development build also has discrete workspace pages at 1:1 scale, Pause/Restore and an interrupted-session recovery journal. Registrations last for the current session. Continuous panning and the zoomed-out overview are planned.
 
 ## Build and try the desktop manager
 
@@ -18,8 +18,24 @@ Open the InfiniteDesk icon in the menu bar and grant Accessibility access when r
 
 1. Focus a window and press **⌃⌥⌘W** to register it. Repeat with a second window.
 2. Press **⌃⌥⌘←** or **⌃⌥⌘→** to focus the previous or next registered window. Type directly in the original application.
-3. Drag a registered window by its title bar, or resize it by an edge. Release the mouse and open the InfiniteDesk menu. The window's row shows its current position and size in macOS points. At the current 1:1 scale, these are also its coordinates on the workspace.
+3. Drag a registered window by its title bar, or resize it by an edge. Release the mouse and open the InfiniteDesk menu. The window's row shows its workspace position and size in macOS points. Page changes preserve these workspace coordinates.
 4. A checkmark identifies the focused registered window. Choose a row to focus that window. A closed window keeps its last known bounds until you forget it. The menu reports when an application cannot send the notifications used for tracking.
+
+For the experimental page controls, use one display and one ordinary macOS Space. Fullscreen windows and windows on other Spaces are outside this stage's scope. Managed windows on other pages are minimized through macOS and restored when you return. The menu reports the current page, camera origin, paused state and operation failures.
+
+| Shortcut | Action |
+|---|---|
+| **⌃⌥⌘W** | Register the focused window without moving it. |
+| **⌃⌥⌘← / →** | Focus the previous/next registered window; reveal its page when necessary. |
+| **⌃⌥⌘N** | Move the focused registered window one page right and follow it. |
+| **⌃⌥⌘[ / ]** | Move the camera to the previous/next workspace page. |
+| **⌃⌥⌘P** | Pause and restore managed windows; press again to resume the workspace. |
+
+These commands are also available from the menu. If macOS cannot register a shortcut, the menu identifies the failed combination; resolve the conflict and choose **Retry global shortcuts**. Bracket shortcuts use the physical US bracket keys.
+
+**Pause and restore windows** makes managed windows accessible again and suspends workspace placement. If restoration fails, **⌃⌥⌘P** retries **Restore parked windows** before allowing Resume. **Restore windows and quit InfiniteDesk** restores them before exiting; a failed restore keeps the manager running and reports the failure. Force Quit cannot run this restore. After an interrupted session, choose **Recover interrupted session…**, restore the listed windows through their application's Window menu or Dock icon, then explicitly acknowledge that you restored them. Recovery does not guess window identity from a title or PID.
+
+On macOS 27.0.1, the local GUI tests verified page switching and immediate typing in two Chrome 156 windows with identical titles on one display. The off-page original disappeared from the on-screen window list, and the visible Finder window kept its bounds. Both Pause and normal Quit released the parked original. After a forced termination, the restarted manager kept the journal available for manual recovery. Continuous panning, zoom and multi-display behavior remain outside this test.
 
 Run the desktop checks without opening windows or granting Accessibility access:
 

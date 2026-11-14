@@ -20,6 +20,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var trusted = DesktopWindowClient.accessibilityTrusted
   private var status = "Register a focused window to begin."
   private var shortcutWarning: String?
+  private var terminating = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     logger.info("manager launched pid=\(ProcessInfo.processInfo.processIdentifier) trusted=\(self.trusted) windows=\(self.client.windows.count)")
@@ -57,6 +58,34 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    guard !terminating else { return .terminateLater }
+    terminating = true
+    status = "Restoring managed windows before quitting…"
+    updateStatus()
+    client.restoreForQuit { [weak self] result in
+      DispatchQueue.main.async {
+        guard let self else { sender.reply(toApplicationShouldTerminate: false); return }
+        switch result {
+        case .success:
+          sender.reply(toApplicationShouldTerminate: true)
+        case .failure(let error):
+          self.terminating = false
+          self.status = "Quit cancelled: \(error.localizedDescription)"
+          self.updateStatus()
+          let alert = NSAlert()
+          alert.messageText = "Could not restore every managed window"
+          alert.informativeText = error.localizedDescription
+            + " InfiniteDesk is still running. Restore the windows and retry Quit."
+          alert.addButton(withTitle: "Keep InfiniteDesk running")
+          alert.runModal()
+          sender.reply(toApplicationShouldTerminate: false)
+        }
+      }
+    }
+    return .terminateLater
+  }
+
   func menuWillOpen(_ menu: NSMenu) {
     menuApplication = externalApplication()
     checkPermission()
@@ -71,7 +100,9 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cycleCursorID = nil
       }
     }
-    testState?.publish(windows: client.windows, focusedID: client.focusedID)
+    testState?.publish(windows: client.windows, focusedID: client.focusedID,
+      camera: client.camera, busy: client.isCameraBusy)
+    updateStatus()
   }
 
   private func externalApplication() -> DesktopApplicationSnapshot? {
@@ -103,6 +134,10 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     case .register: register(application: externalApplication())
     case .previous: cycle(direction: -1)
     case .next: cycle(direction: 1)
+    case .moveToNewPage: moveToNewPage()
+    case .previousPage: changePage(by: -1)
+    case .nextPage: changePage(by: 1)
+    case .pause: togglePause()
     }
   }
 
@@ -181,6 +216,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   private func requirePermission() -> Bool {
+    guard !terminating else { return false }
     checkPermission()
     guard trusted else {
       logger.error("command rejected reason=accessibility_denied windows=\(self.client.windows.count)")
@@ -189,6 +225,48 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
       return false
     }
     return true
+  }
+
+  private func moveToNewPage() {
+    guard requirePermission() else { return }
+    cycleCursorID = nil
+    status = "Moving the focused registered window one page right…"
+    updateStatus()
+    client.moveFocusedToNewPage { [weak self] result in
+      self?.cameraCommandCompleted(result, success: "Moved the focused window and followed it.")
+    }
+  }
+
+  private func changePage(by direction: Int) {
+    guard requirePermission() else { return }
+    cycleCursorID = nil
+    status = "Switching workspace page…"
+    updateStatus()
+    client.moveCamera(by: direction) { [weak self] result in
+      self?.cameraCommandCompleted(result, success: "Workspace page changed.")
+    }
+  }
+
+  private func togglePause() {
+    guard requirePermission() else { return }
+    let pause = !client.camera.paused || client.windows.contains(where: { $0.managerMinimized })
+    cycleCursorID = nil
+    status = pause ? "Restoring managed windows and pausing…" : "Resuming workspace…"
+    updateStatus()
+    client.setCameraPaused(pause) { [weak self] result in
+      self?.cameraCommandCompleted(result,
+        success: pause ? "Paused. Managed windows restored." : "Workspace resumed.")
+    }
+  }
+
+  private func cameraCommandCompleted(
+    _ result: Result<DesktopCameraSnapshot, DesktopWindowError>, success: String
+  ) {
+    switch result {
+    case .success: status = success
+    case .failure(let error): status = error.localizedDescription
+    }
+    updateStatus()
   }
 
   private func logCommand(_ command: String, source: String) {
@@ -205,17 +283,34 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     case .unavailable: availability = " · unavailable (last known bounds)"
     case .closed: availability = " · closed (last known bounds)"
     }
-    return "\(number). \(window.appName) — \(window.title.isEmpty ? "Untitled window" : window.title) · \(geometry)\(availability)"
+    let placement = " · page \(window.cameraPage)" + (window.managerMinimized ? " · parked (minimized)" : "")
+    return "\(number). \(window.appName) — \(window.title.isEmpty ? "Untitled window" : window.title) · \(geometry)\(placement)\(availability)"
   }
 
   private func updateStatus() {
-    statusItem?.button?.toolTip = "InfiniteDesk — \(status)"
+    let camera = client.camera
+    let mode = camera.paused ? "paused" : "page \(camera.page)"
+    statusItem?.button?.toolTip = "InfiniteDesk · \(mode) — \(status)"
   }
 
   private func rebuildMenu() {
     menu.removeAllItems()
     append("InfiniteDesk · \(client.windows.count) registered", enabled: false)
     append(trusted ? "Accessibility: enabled" : "Accessibility: permission required", enabled: false)
+    let camera = client.camera
+    let cameraGeometry = String(format: "%.0f, %.0f", camera.origin.x, camera.origin.y)
+    let hasParkedWindows = client.windows.contains(where: { $0.managerMinimized })
+    append(camera.paused ? (camera.recoveryCount > 0 ? "Workspace: paused · interrupted session needs recovery"
+      : hasParkedWindows ? "Workspace: paused · parked windows need restoration"
+      : "Workspace: paused · managed windows released")
+      : "Workspace page \(camera.page) · camera \(cameraGeometry) pt · 1:1", enabled: false)
+    if let detail = camera.detail { append(detail, enabled: false).toolTip = detail }
+    if camera.recoveryCount > 0 {
+      append("Recovery required: \(camera.recoveryCount) interrupted window records", enabled: false)
+      append("Recover interrupted session…", action: #selector(recoverInterruptedSession),
+        enabled: !terminating && !client.isCameraBusy)
+    }
+    if client.isCameraBusy { append("Workspace operation in progress…", enabled: false) }
     if let observationStatus = client.observationStatus {
       let observationItem = append(observationStatus, enabled: false)
       observationItem.toolTip = observationStatus
@@ -227,21 +322,34 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
       warning.toolTip = shortcutWarning
     }
     menu.addItem(.separator())
-    append("Register focused window", action: #selector(registerFromMenu), enabled: trusted,
+    let available = trusted && !terminating && !client.isCameraBusy
+    let workspaceAvailable = available && camera.recoveryCount == 0
+    append("Register focused window", action: #selector(registerFromMenu), enabled: available,
       shortcut: .register)
-    append("Previous window", action: #selector(previousFromMenu), enabled: trusted && !client.windows.isEmpty,
+    append("Previous window", action: #selector(previousFromMenu), enabled: available && !client.windows.isEmpty,
       shortcut: .previous)
-    append("Next window", action: #selector(nextFromMenu), enabled: trusted && !client.windows.isEmpty,
+    append("Next window", action: #selector(nextFromMenu), enabled: available && !client.windows.isEmpty,
       shortcut: .next)
+    menu.addItem(.separator())
+    append("Move focused window one page right and follow", action: #selector(moveToNewPageFromMenu),
+      enabled: workspaceAvailable && !camera.paused && client.focusedID != nil, shortcut: .moveToNewPage)
+    append("Previous workspace page", action: #selector(previousPageFromMenu),
+      enabled: workspaceAvailable && !camera.paused, shortcut: .previousPage)
+    append("Next workspace page", action: #selector(nextPageFromMenu),
+      enabled: workspaceAvailable && !camera.paused, shortcut: .nextPage)
+    let pauseTitle = camera.paused ? (hasParkedWindows ? "Restore parked windows" : "Resume workspace")
+      : "Pause and restore windows"
+    append(pauseTitle, action: #selector(pauseFromMenu),
+      enabled: available && (hasParkedWindows || camera.recoveryCount == 0), shortcut: .pause)
     menu.addItem(.separator())
     if client.windows.isEmpty {
       append("No registered windows", enabled: false)
     } else {
       for window in client.windows {
-        let item = append(label(window), action: #selector(selectFromMenu(_:)), enabled: trusted && window.availability != .closed)
+        let item = append(label(window), action: #selector(selectFromMenu(_:)), enabled: available && window.availability != .closed)
         item.representedObject = window.id.uuidString
         item.state = client.focusedID == window.id ? .on : .off
-        item.toolTip = "PID \(window.pid) · Current AX bounds: \(window.worldFrame)"
+        item.toolTip = "PID \(window.pid) · Workspace bounds: \(window.worldFrame)"
           + (window.observationDetail.map { " · \($0)" } ?? "")
       }
       let forgetItem = append("Forget registered window")
@@ -250,6 +358,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
       for window in client.windows {
         let item = NSMenuItem(title: label(window), action: #selector(forgetFromMenu(_:)), keyEquivalent: "")
         item.target = self
+        item.isEnabled = available
         item.representedObject = window.id.uuidString
         forgetMenu.addItem(item)
       }
@@ -260,7 +369,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     append("Open Accessibility settings…", action: #selector(openAccessibility))
     append("Retry global shortcuts", action: #selector(retryShortcuts))
     menu.addItem(.separator())
-    append("Quit InfiniteDesk", action: #selector(quit))
+    append("Restore windows and quit InfiniteDesk", action: #selector(quit), enabled: !terminating)
   }
 
   @discardableResult
@@ -287,6 +396,54 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   @objc private func nextFromMenu() {
     logCommand("next", source: "menu")
     cycle(direction: 1)
+  }
+  @objc private func moveToNewPageFromMenu() {
+    logCommand("move-to-new-page", source: "menu")
+    moveToNewPage()
+  }
+  @objc private func previousPageFromMenu() {
+    logCommand("previous-page", source: "menu")
+    changePage(by: -1)
+  }
+  @objc private func nextPageFromMenu() {
+    logCommand("next-page", source: "menu")
+    changePage(by: 1)
+  }
+  @objc private func pauseFromMenu() {
+    logCommand("pause-restore", source: "menu")
+    togglePause()
+  }
+  @objc private func recoverInterruptedSession() {
+    guard !terminating, !client.isCameraBusy, client.camera.recoveryCount > 0 else { return }
+    let alert = NSAlert()
+    alert.messageText = "Restore the interrupted session manually"
+    alert.informativeText = "Use each application's Window menu or Dock icon to restore minimized windows, "
+      + "then move and resize them to the saved original bounds below. "
+      + "InfiniteDesk cannot safely identify these exact windows after restarting. "
+      + "Acknowledge only after restoring them or confirming that they closed."
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 260))
+    scroll.hasVerticalScroller = true
+    scroll.borderType = .bezelBorder
+    let text = NSTextView(frame: scroll.bounds)
+    text.isEditable = false
+    text.isSelectable = true
+    text.isVerticallyResizable = true
+    text.isHorizontallyResizable = false
+    text.textContainer?.widthTracksTextView = true
+    text.textContainer?.containerSize = NSSize(width: scroll.contentSize.width, height: .greatestFiniteMagnitude)
+    text.textContainerInset = NSSize(width: 8, height: 8)
+    text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    text.string = client.recoveryInstructions
+    text.autoresizingMask = [.width]
+    scroll.documentView = text
+    alert.accessoryView = scroll
+    alert.addButton(withTitle: "Keep recovery records")
+    let acknowledge = alert.addButton(withTitle: "I restored these windows manually")
+    acknowledge.keyEquivalent = ""
+    guard alert.runModal() == .alertSecondButtonReturn else { return }
+    client.acknowledgeManualRecovery { [weak self] result in
+      self?.cameraCommandCompleted(result, success: "Manual recovery acknowledged. Workspace controls are available.")
+    }
   }
   @objc private func selectFromMenu(_ item: NSMenuItem) {
     guard let value = item.representedObject as? String, let id = UUID(uuidString: value) else { return }

@@ -15,6 +15,13 @@ const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const here = dirname(fileURLToPath(import.meta.url));
 const statePath = process.env.INFINITEDESK_TEST_STATE_PATH;
 if (statePath !== undefined) assert(isAbsolute(statePath), 'INFINITEDESK_TEST_STATE_PATH must be an explicit absolute path');
+const cameraMode = process.env.INFINITEDESK_TEST_CAMERA_MODE;
+const journalPath = process.env.INFINITEDESK_TEST_CAMERA_JOURNAL_PATH;
+const session = process.env.INFINITEDESK_TEST_SESSION;
+if (cameraMode) {
+  assert(['quit', 'crash'].includes(cameraMode) && statePath && isAbsolute(journalPath ?? '')
+    && /^[a-f0-9-]{32,36}$/i.test(session ?? ''), 'Camera acceptance needs an isolated test manager, journal, and session UUID');
+}
 const geometryCases = ['Original model geometry', 'External titlebar click focuses B', 'Fast titlebar drag B',
   'Real corner resize B', 'Second titlebar drag B', 'Rapid consecutive titlebar drags B', 'Chrome minimum-size constraint', 'Destroyed B model state',
   'Replacement is not automatically registered'];
@@ -44,7 +51,7 @@ if (check.status === 77) {
   await writeFile(skippedReport, JSON.stringify({
     status: 'SKIP', at: new Date().toISOString(), prerequisites: JSON.parse(check.stdout),
     platform: process.platform, architecture: process.arch, node: process.version,
-    fixturesLaunched: false, managerActionsSent: false,
+    fixturesLaunched: false, managerActionsSent: false, camera: { mode: cameraMode, status: cameraMode ? 'SKIP' : 'NOT_REQUESTED' },
     cases: Object.fromEntries(caseNames.map(name => [name, 'NOT_RUN'])),
     unverified: ['All live focus, registration, typing, same-title and closed-target cases; fixture launch was skipped'],
     geometry: { status: statePath ? 'SKIP' : 'NOT_REQUESTED', cases: Object.fromEntries(geometryCases.map(name => [name, 'NOT_RUN'])) },
@@ -53,6 +60,13 @@ if (check.status === 77) {
   process.exit(77);
 }
 if (check.error || check.status !== 0) throw check.error ?? new Error(check.stderr);
+if (cameraMode) {
+  const model = await readModel();
+  assert.equal(model.testSession, session);
+  assert.equal(model.camera?.pendingRecoveryCount, 0);
+  assert.equal(model.windows.length, 0, 'Camera acceptance requires an empty manager');
+  native('manager-identity', model.managerPID, session, statePath, journalPath);
+}
 await access(chrome, constants.X_OK);
 
 class CDP {
@@ -102,7 +116,8 @@ class CDP {
 
 const directory = await mkdtemp(join(tmpdir(), 'infinitedesk-desktop-acceptance-'));
 const report = {
-  schemaVersion: 2,
+  schemaVersion: 3,
+  camera: { mode: cameraMode, status: cameraMode ? 'NOT_RUN' : 'NOT_REQUESTED', checkpoints: [] },
   status: 'RUNNING', started: new Date().toISOString(),
   platform: process.platform, architecture: process.arch, node: process.version,
   directory, prerequisites: JSON.parse(check.stdout),
@@ -113,7 +128,7 @@ const report = {
   nativeFocusCases: Object.fromEntries(caseNames.slice(1).map(name => [name, 'NOT_RUN'])),
   nativeFocusStatus: 'NOT_RUN',
   inputStatus: 'NOT_RUN',
-  geometry: { status: statePath ? 'NOT_RUN' : 'NOT_REQUESTED', statePath: statePath ?? null,
+  geometry: { status: statePath && !cameraMode ? 'NOT_RUN' : 'NOT_REQUESTED', statePath: statePath ?? null,
     cases: Object.fromEntries(geometryCases.map(name => [name, 'NOT_RUN'])), evidence: [],
     finder: { status: 'NOT_RUN' }, constraint: { status: 'NOT_RUN' } },
   cases: Object.fromEntries(caseNames.map(name => [name, 'NOT_RUN'])),
@@ -161,6 +176,7 @@ async function createTarget(name, bounds) {
   const target = { targetId, sessionId };
   await eventually('Fixture DOM did not become ready', () => evaluate(target, 'document.readyState'), value => value === 'complete');
   const { windowId } = await cdp.send('Browser.getWindowForTarget', { targetId });
+  target.windowId = windowId;
   await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
   await cdp.send('Browser.setWindowBounds', { windowId, bounds });
   targets[name] = target;
@@ -456,83 +472,8 @@ async function stageTwo(originals) {
   await saveReport();
 }
 
-try {
-  if (statePath) {
-    const initial = await readModel();
-    report.geometry.initialEmptyModel = initial;
-    assert.equal(initial.windows.length, 0, 'Stage 2 requires an actually empty manager model before any shortcuts');
-  }
-  const endpoint = await eventually('Disposable Chrome did not expose DevTools', async () => {
-    if (childError) throw childError;
-    if (child.exitCode !== null) throw new Error(`Disposable Chrome exited ${child.exitCode}`);
-    try { return await readFile(join(directory, 'profile', 'DevToolsActivePort'), 'utf8'); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; return ''; }
-  }, value => value.split('\n').length >= 2, 15_000);
-  const [port, path] = endpoint.trim().split('\n');
-  assert(/^\d+$/.test(port) && path.startsWith('/devtools/browser/'), 'Invalid disposable DevTools endpoint');
-  const listener = spawnSync('/usr/sbin/lsof', ['-nP', '-a', '-p', String(child.pid),
-    `-iTCP:${port}`, '-sTCP:LISTEN', '-Fn'], { encoding: 'utf8', timeout: 5_000 });
-  if (listener.error) throw listener.error;
-  assert.equal(listener.status, 0, 'Cannot verify the disposable Chrome debugger listener');
-  const addresses = listener.stdout.split('\n').filter(line => line.startsWith('n')).map(line => line.slice(1));
-  assert.deepEqual(addresses, [`127.0.0.1:${port}`], 'Chrome debugger must listen only on IPv4 loopback');
-  report.debugger = { addresses, childPID: child.pid, profile: join(directory, 'profile') };
-  await cdp.connect(`ws://127.0.0.1:${port}${path}`);
-  const version = await cdp.send('Browser.getVersion');
-  report.chrome = version;
-  const { processInfo } = await cdp.send('SystemInfo.getProcessInfo');
-  pid = processInfo.find(item => item.type === 'browser')?.id;
-  assert.equal(pid, child.pid, 'DevTools must belong to the exact process spawned with the disposable profile');
-  browserIdentityVerified = true;
-  report.chromePID = pid;
-  const initial = await cdp.send('Target.getTargets');
-  if (statePath) {
-    const first = initial.targetInfos.find(target => target.type === 'page');
-    assert(first, 'Expected an owned blank page for work-area discovery');
-    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: first.targetId, flatten: true });
-    const area = await evaluate({ sessionId }, '({x: screen.availLeft, y: screen.availTop, width: screen.availWidth, height: screen.availHeight})');
-    report.geometry.workArea = area;
-    const plan = planOriginals(area);
-    report.geometry.plannedOriginals = plan;
-    for (const name of ['A', 'B']) {
-      const frame = plan[name];
-      await createTarget(name, { left: frame.x, top: frame.y, width: frame.width, height: frame.height });
-    }
-  } else {
-    await createTarget('A', { left: 72, top: 100, width: 620, height: 470 });
-    await createTarget('B', { left: 360, top: 230, width: 650, height: 490 });
-  }
-  for (const target of initial.targetInfos.filter(item => item.type === 'page')) {
-    await cdp.send('Target.closeTarget', { targetId: target.targetId });
-  }
-  const pair = await eventually('Expected exactly two original native Chrome windows', async () => snapshot(),
-    state => state.windows.length === 2 && ['A', 'B'].every(name => state.windows.some(item => item.title.startsWith(`InfiniteDesk Desktop Fixture ${name}`))));
-  const a = pair.windows.find(item => item.title.startsWith('InfiniteDesk Desktop Fixture A'));
-  const b = pair.windows.find(item => item.title.startsWith('InfiniteDesk Desktop Fixture B'));
-  assert.notEqual(a.id, b.id);
-  assert(!sameFrame(a.frame, b.frame), 'The test requires distinct noncentral native frames');
+async function verifyFocusAndGeometry(a, b) {
   const baseline = [a, b];
-  report.originals = { A: a, B: b };
-  let setupInputPassed = true;
-  for (const [name, window] of [['A', a], ['B', b]]) {
-    native('focus', pid, window.id);
-    await evaluate(targets[name], `(() => { const field = document.querySelector('#target'); field.focus();
-      field.setSelectionRange(field.value.length, field.value.length); })()`);
-    const inputPassed = await typeToken(`Setup ${name}`, name, window.id, `-original-${name}`);
-    setupInputPassed = inputPassed && setupInputPassed;
-    if (statePath && name === 'A') {
-      assert.equal((await readModel()).windows.length, 0, 'Manager gained registrations during setup; refusing the first shortcut');
-    }
-    await fixtureShortcut(window.id, 'register');
-    // The production registration has no external completion API. Subsequent
-    // focus/DOM assertions fail if the hotkey was not actually registered.
-    await pause(500);
-  }
-  report.registrationShortcutsSent = 2;
-  report.cases['Original A/B setup input'] = setupInputPassed ? 'PASS' : 'FAIL';
-  report.setupEvidence = await evidence();
-  unchanged(requireNative(report.setupEvidence), baseline);
-  await saveReport();
   let selected = b;
   async function cycle(direction, destination, name, token, label, remaining = baseline) {
     report.activeNativeCase = label;
@@ -624,9 +565,109 @@ try {
   report.inputStatus = Object.values(report.inputCases).every(value => value === 'PASS') && replacementUntouched ? 'PASS' : 'FAIL';
   report.status = report.inputStatus;
   if (report.status === 'FAIL') process.exitCode = 1;
+}
+
+try {
+  if (statePath) {
+    const initial = await readModel();
+    report.geometry.initialEmptyModel = initial;
+    assert.equal(initial.windows.length, 0, 'Stage 2 requires an actually empty manager model before any shortcuts');
+  }
+  const endpoint = await eventually('Disposable Chrome did not expose DevTools', async () => {
+    if (childError) throw childError;
+    if (child.exitCode !== null) throw new Error(`Disposable Chrome exited ${child.exitCode}`);
+    try { return await readFile(join(directory, 'profile', 'DevToolsActivePort'), 'utf8'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; return ''; }
+  }, value => value.split('\n').length >= 2, 15_000);
+  const [port, path] = endpoint.trim().split('\n');
+  assert(/^\d+$/.test(port) && path.startsWith('/devtools/browser/'), 'Invalid disposable DevTools endpoint');
+  const listener = spawnSync('/usr/sbin/lsof', ['-nP', '-a', '-p', String(child.pid),
+    `-iTCP:${port}`, '-sTCP:LISTEN', '-Fn'], { encoding: 'utf8', timeout: 5_000 });
+  if (listener.error) throw listener.error;
+  assert.equal(listener.status, 0, 'Cannot verify the disposable Chrome debugger listener');
+  const addresses = listener.stdout.split('\n').filter(line => line.startsWith('n')).map(line => line.slice(1));
+  assert.deepEqual(addresses, [`127.0.0.1:${port}`], 'Chrome debugger must listen only on IPv4 loopback');
+  report.debugger = { addresses, childPID: child.pid, profile: join(directory, 'profile') };
+  await cdp.connect(`ws://127.0.0.1:${port}${path}`);
+  const version = await cdp.send('Browser.getVersion');
+  report.chrome = version;
+  const { processInfo } = await cdp.send('SystemInfo.getProcessInfo');
+  pid = processInfo.find(item => item.type === 'browser')?.id;
+  assert.equal(pid, child.pid, 'DevTools must belong to the exact process spawned with the disposable profile');
+  browserIdentityVerified = true;
+  report.chromePID = pid;
+  const initial = await cdp.send('Target.getTargets');
+  if (statePath) {
+    const first = initial.targetInfos.find(target => target.type === 'page');
+    assert(first, 'Expected an owned blank page for work-area discovery');
+    const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: first.targetId, flatten: true });
+    const area = await evaluate({ sessionId }, '({x: screen.availLeft, y: screen.availTop, width: screen.availWidth, height: screen.availHeight})');
+    report.geometry.workArea = area;
+    const plan = planOriginals(area);
+    report.geometry.plannedOriginals = plan;
+    for (const name of ['A', 'B']) {
+      const frame = plan[name];
+      await createTarget(name, { left: frame.x, top: frame.y, width: frame.width, height: frame.height });
+    }
+  } else {
+    await createTarget('A', { left: 72, top: 100, width: 620, height: 470 });
+    await createTarget('B', { left: 360, top: 230, width: 650, height: 490 });
+  }
+  for (const target of initial.targetInfos.filter(item => item.type === 'page')) {
+    await cdp.send('Target.closeTarget', { targetId: target.targetId });
+  }
+  const pair = await eventually('Expected exactly two original native Chrome windows', async () => snapshot(),
+    state => state.windows.length === 2 && ['A', 'B'].every(name => state.windows.some(item => item.title.startsWith(`InfiniteDesk Desktop Fixture ${name}`))));
+  const a = pair.windows.find(item => item.title.startsWith('InfiniteDesk Desktop Fixture A'));
+  const b = pair.windows.find(item => item.title.startsWith('InfiniteDesk Desktop Fixture B'));
+  assert.notEqual(a.id, b.id);
+  assert(!sameFrame(a.frame, b.frame), 'The test requires distinct noncentral native frames');
+  const baseline = [a, b];
+  report.originals = { A: a, B: b };
+  let setupInputPassed = true;
+  for (const [name, window] of [['A', a], ['B', b]]) {
+    native('focus', pid, window.id);
+    await evaluate(targets[name], `(() => { const field = document.querySelector('#target'); field.focus();
+      field.setSelectionRange(field.value.length, field.value.length); })()`);
+    const inputPassed = await typeToken(`Setup ${name}`, name, window.id, `-original-${name}`);
+    setupInputPassed = inputPassed && setupInputPassed;
+    if (statePath && name === 'A') {
+      assert.equal((await readModel()).windows.length, 0, 'Manager gained registrations during setup; refusing the first shortcut');
+    }
+    await fixtureShortcut(window.id, 'register');
+    // The production registration has no external completion API. Subsequent
+    // focus/DOM assertions fail if the hotkey was not actually registered.
+    await pause(500);
+  }
+  report.registrationShortcutsSent = 2;
+  report.cases['Original A/B setup input'] = setupInputPassed ? 'PASS' : 'FAIL';
+  report.setupEvidence = await evidence();
+  unchanged(requireNative(report.setupEvidence), baseline);
+  await saveReport();
+  if (cameraMode) {
+    const { verifyCamera } = await import('./camera.mjs');
+    const readBounds = async name => (await cdp.send('Browser.getWindowBounds', { windowId: targets[name].windowId })).bounds;
+    const restoreFixture = async name => {
+      assert(['A', 'B'].includes(name));
+      await cdp.send('Browser.setWindowBounds', { windowId: targets[name].windowId, bounds: { windowState: 'normal' } });
+    };
+    for (const target of [targets.A, targets.B]) await evaluate(target, 'document.title = "InfiniteDesk Identical Title"');
+    await eventually('Fixture windows need matching AX titles', async () => snapshot(), state =>
+      state.windows.length === 2 && state.windows.every(window => window.title.startsWith('InfiniteDesk Identical Title')));
+    await verifyCamera({ mode: cameraMode, originals: { A: a, B: b }, pid, journalPath, statePath, session,
+      readModel, readBounds, restoreFixture, snapshot, native, fixtureShortcut, typeToken, eventually, report, saveReport });
+    assert(setupInputPassed, 'Native typing failed during registration');
+    report.inputStatus = 'PASS';
+    report.camera.status = 'PASS';
+    report.status = 'PASS';
+  } else {
+    await verifyFocusAndGeometry(a, b);
+  }
+
 } catch (error) {
   report.status = 'FAIL';
-  if (statePath && report.geometry.status !== 'PASS') report.geometry.status = 'FAIL';
+  if (cameraMode) report.camera.status = 'FAIL';
+  if (statePath && !cameraMode && report.geometry.status !== 'PASS') report.geometry.status = 'FAIL';
   report.error = error.stack ?? String(error);
   report.nativeFocusStatus = 'INCOMPLETE';
   if (report.activeNativeCase && report.nativeFocusCases[report.activeNativeCase] !== 'PASS') {
