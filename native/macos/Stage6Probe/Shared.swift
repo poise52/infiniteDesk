@@ -171,6 +171,26 @@ struct AXCheckState {
     return now - checkedAt < 0.5
   }
 }
+struct FocusKeyQueue {
+  struct Event: Equatable {
+    let code: UInt16
+    let down: Bool
+    let flags: UInt64
+  }
+  private(set) var events: [Event] = []
+  let limit: Int
+  init(limit: Int = 64) { self.limit = limit }
+  mutating func append(_ event: Event) -> Bool {
+    guard events.count < limit else { return false }
+    events.append(event)
+    return true
+  }
+  mutating func takeAll() -> [Event] {
+    defer { events.removeAll(keepingCapacity: true) }
+    return events
+  }
+  mutating func cancel() { events.removeAll(keepingCapacity: true) }
+}
 struct PressedState {
   private(set) var mouse: CGPoint?
   private(set) var keys: Set<UInt16> = []

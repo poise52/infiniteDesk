@@ -74,6 +74,18 @@ On macOS, `/usr/bin/time -l -- target/release/desk-app --benchmark ...` reports 
 
 Select **Mouse AppKit local CG** by cycling the mouse-mode button three times. On macOS 27.0.1, clicking the captured **Sheet** button opened the fixture's dialog at 0.5×, 1× and 2×. Clicking the captured text editor in the inactive fixture delivered matching coordinates but left the text unchanged on the next keystroke. With the fixture active, its window key and its text view focused, the probe moved the caret, inserted a character and replaced a dragged selection. The receiving window reports its ID, local coordinates, mouse event numbers, hit view and activation state so the two cases can be reproduced.
 
-The experiment uses the fixture's own window identifier and an empirical coordinate conversion. Third-party window identity, focus transfer from the board, IME and routing across dialogs remain open. The AppKit probe runs separately from the Rust/Metal canvas. Its local mouse monitor sees normal fixture dispatch and may miss events in nested tracking loops.
+To type into the background fixture, choose **AX text ON** and **Input ON**.
+Bring the Probe window to the front, click the first line of text in its
+preview and type. This mode uses the clicked text control's Accessibility
+range to place the caret. On macOS 27.0.1 the Probe kept keyboard focus while
+the fixture received text at 0.5×, 1× and 2×. Click the empty board to stop
+sending keystrokes to that editor. The mouse-mode selector applies when
+**AX text** is off.
+
+Both experiments use the fixture's own window identifier. The pointer modes
+use an empirical coordinate conversion. Third-party window identity, IME and
+routing across dialogs remain open. The AppKit probe runs separately from the
+Rust/Metal canvas. Its local mouse monitor sees normal fixture dispatch and
+may miss events in nested tracking loops.
 
 The probe keeps one latest-frame slot in memory and limits each accepted buffer to 32 MiB. It disables input after two seconds without a complete or idle capture callback. Recheck permission status after rebuilding either ad-hoc signed app.

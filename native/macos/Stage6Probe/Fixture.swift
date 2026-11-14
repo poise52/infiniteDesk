@@ -41,6 +41,9 @@ final class FixtureView: NSView {
   var window: NSWindow!
   var child: NSWindow?
   var mouseMonitor: Any?
+  var focusTimer: Timer?
+  weak var focusText: NSTextView?
+  let focusStatus = NSTextField(labelWithString: "Focus unavailable")
   func applicationDidFinishLaunching(_ notification: Notification) {
     window = NSWindow(
       contentRect: NSRect(x: 160, y: 180, width: 640, height: 480),
@@ -92,11 +95,15 @@ final class FixtureView: NSView {
       }
       return event
     }
-    let scroll = NSScrollView(frame: NSRect(x: 20, y: 130, width: 400, height: 210))
+    focusStatus.frame = NSRect(x: 20, y: 118, width: 610, height: 18)
+    focusStatus.autoresizingMask = [.maxYMargin]
+    view.addSubview(focusStatus)
+    let scroll = NSScrollView(frame: NSRect(x: 20, y: 140, width: 400, height: 200))
     scroll.hasVerticalScroller = true
     let text = NSTextView(frame: scroll.bounds)
     text.string = "Synthetic fixture: edit this text.\n"
     scroll.documentView = text
+    focusText = text
     view.addSubview(scroll)
     let sheet = NSButton(title: "Sheet", target: self, action: #selector(showSheet))
     sheet.frame = NSRect(x: 440, y: 250, width: 120, height: 32)
@@ -107,9 +114,20 @@ final class FixtureView: NSView {
     window.contentView = view
     window.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
+    updateFocusStatus()
+    focusTimer = Timer.scheduledTimer(
+      timeInterval: 0.25, target: self, selector: #selector(updateFocusStatus), userInfo: nil,
+      repeats: true)
     let identity =
       "fixture pid=\(ProcessInfo.processInfo.processIdentifier) window=\(window.windowNumber)\n"
     FileHandle.standardOutput.write(Data(identity.utf8))
+  }
+  @objc func updateFocusStatus() {
+    guard let text = focusText else { return }
+    let responder = window.firstResponder.map { String(describing: type(of: $0)) } ?? "none"
+    let status =
+      "Fixture active=\(NSApp.isActive) key=\(window.isKeyWindow) responder=\(responder) text=\(window.firstResponder === text) selection=\(text.selectedRange())"
+    if focusStatus.stringValue != status { focusStatus.stringValue = status }
   }
   @objc func showSheet() {
     let alert = NSAlert()
@@ -135,6 +153,7 @@ final class FixtureView: NSView {
     child = w
   }
   func applicationWillTerminate(_ notification: Notification) {
+    focusTimer?.invalidate()
     if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
   }
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

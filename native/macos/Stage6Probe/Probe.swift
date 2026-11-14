@@ -225,7 +225,7 @@ final class Canvas: NSView {
   func forward(_ event: NSEvent, _ type: CGEventType) {
     let point = mappedPoint(
       convert(event.locationInWindow, from: nil), imageRect: imageRect, sourceRect: sourceRect)
-    if point != nil || type == .leftMouseUp { input?(type, point) }
+    if point != nil || type == .leftMouseDown || type == .leftMouseUp { input?(type, point) }
   }
   override func mouseDown(with e: NSEvent) {
     window?.makeFirstResponder(self)
@@ -260,7 +260,10 @@ final class Canvas: NSView {
   weak var inputButton: NSButton?
   var inputEnabled = false {
     didSet {
-      if oldValue && !inputEnabled { axCheck.invalidate() }
+      if oldValue && !inputEnabled {
+        axCheck.invalidate()
+        cancelFocusExperiment()
+      }
       inputButton?.title = inputEnabled ? "Input ON" : "Input OFF"
     }
   }
@@ -285,6 +288,16 @@ final class Canvas: NSView {
   var mouseMode: MouseMode = .cg
   var mouseConstruction = "CG"
   var mouseEventNumber = 0
+  var focusMode = false
+  var focusToken: FocusCancellation?
+  var focusPoint: CGPoint?
+  var focusFrame: CGRect?
+  var focusPending = false
+  var focusKeys = FocusKeyQueue()
+  var focusKeyChecking = false
+  var focusSnapshot = "focus snapshot unavailable"
+  var focusKeySnapshot = "key snapshot unavailable"
+  var focusDiagnostic = "AX text focus OFF"
   func applicationDidFinishLaunching(_ notification: Notification) {
     window = NSWindow(
       contentRect: NSRect(x: 100, y: 100, width: 1100, height: 800),
@@ -303,6 +316,7 @@ final class Canvas: NSView {
       ("Request AX", #selector(requestAX)), ("Launch fixture", #selector(launchFixture)),
       ("Start capture", #selector(startCapture)), ("Stop", #selector(stopCapture)),
       ("Input OFF", #selector(toggleInput)), ("Mouse CG", #selector(toggleMouseMode)),
+      ("AX text OFF", #selector(toggleFocusMode)),
       ("0.5×", #selector(zoomHalf)), ("1×", #selector(zoomOne)), ("2×", #selector(zoomTwo)),
     ] {
       let button = NSButton(title: title, target: self, action: action)
@@ -671,7 +685,7 @@ final class Canvas: NSView {
     let down = lastMouseDown.map { String(describing: $0) } ?? "none"
     let up = lastMouseUp.map { String(describing: $0) } ?? "none"
     status.stringValue =
-      "\(frameDiagnostic) | input \(inputEnabled ? "ON" : "OFF")\nSCK screenRect: \(screen) | AX rect: \(ax)\nAX: \(axDiagnostic)\nPosted mouse: \(postedMouseEvents), down=\(down), up=\(up) | \(mouseConstruction)"
+      "\(frameDiagnostic) | input \(inputEnabled ? "ON" : "OFF")\nSCK screenRect: \(screen) | AX rect: \(ax)\nAX: \(axDiagnostic)\nPosted mouse: \(postedMouseEvents), down=\(down), up=\(up) | \(mouseConstruction)\n\(focusDiagnostic) | \(focusSnapshot) | \(focusKeySnapshot) | now: \(focusState())"
   }
   func validateGeometry() {
     let r = canvas.sourceRect
@@ -766,6 +780,135 @@ final class Canvas: NSView {
       && streamActivityFresh(last: lastStreamActivity, now: ProcessInfo.processInfo.systemUptime)
       && axCheck.fresh(now: ProcessInfo.processInfo.systemUptime) && stream != nil && validFixture()
       && AXIsProcessTrusted() && CGPreflightPostEventAccess()
+  }
+  func focusState() -> String {
+    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    let fixturePID = fixture?.processIdentifier
+    let owner =
+      front == ProcessInfo.processInfo.processIdentifier
+      ? "probe"
+      : (front != nil && front == fixturePID ? "fixture" : "other/unknown")
+    return
+      "frontmost=\(owner) probe active=\(NSApp.isActive) key=\(window.isKeyWindow) canvas=\(window.firstResponder === canvas) fixture active=\(fixturePID.flatMap { NSRunningApplication(processIdentifier: $0) }?.isActive.description ?? "unknown")"
+  }
+  func probeHasFocus() -> Bool {
+    NSWorkspace.shared.frontmostApplication?.processIdentifier
+      == ProcessInfo.processInfo.processIdentifier
+      && NSApp.isActive && window.isKeyWindow && window.firstResponder === canvas
+  }
+  func cancelFocusExperiment() {
+    focusToken?.cancel()
+    focusToken = nil
+    focusPoint = nil
+    focusFrame = nil
+    focusPending = false
+    focusKeys.cancel()
+    focusKeyChecking = false
+  }
+  @objc func toggleFocusMode(_ sender: NSButton) {
+    NSApp.activate(ignoringOtherApps: true)
+    window.makeKeyAndOrderFront(nil)
+    releaseInput()
+    cancelFocusExperiment()
+    focusMode.toggle()
+    sender.title = focusMode ? "AX text ON" : "AX text OFF"
+    focusDiagnostic = focusMode ? "AX text: click fixture editor" : "AX text focus OFF"
+    updateGeometryStatus()
+  }
+  func startFocusExperiment(_ point: CGPoint) {
+    guard let process = fixture else { return }
+    focusSnapshot = "click start: \(focusState())"
+    focusKeySnapshot = "key snapshot unavailable"
+    guard probeHasFocus() else {
+      releaseInput()
+      cancelFocusExperiment()
+      focusDiagnostic = "AX text blocked: Probe is not frontmost/key/canvas"
+      updateGeometryStatus()
+      return
+    }
+    releaseInput()
+    cancelFocusExperiment()
+    let token = FocusCancellation()
+    focusToken = token
+    focusPoint = point
+    let frame = canvas.sourceRect
+    focusFrame = frame
+    focusPending = true
+    focusDiagnostic = "AX text focus pending"
+    updateGeometryStatus()
+    let started = ProcessInfo.processInfo.systemUptime
+    let pid = process.processIdentifier
+    axQueue.async { [weak self] in
+      let result = fixtureTextFocus(
+        pid: pid, point: point, expectedFrame: frame, placeCaret: true, token: token)
+      Task { @MainActor [weak self] in
+        guard let self, self.focusToken === token, !token.isCancelled() else { return }
+        self.focusPending = false
+        self.focusSnapshot += " | AX completion: \(self.focusState())"
+        guard self.permitted(), self.focusMode, self.probeHasFocus(),
+          self.canvas.sourceRect == frame,
+          ProcessInfo.processInfo.systemUptime - started < 0.5
+        else {
+          self.cancelFocusExperiment()
+          self.focusDiagnostic = "AX text focus expired or session changed"
+          self.updateGeometryStatus()
+          return
+        }
+        switch result {
+        case .verified(let detail):
+          self.focusDiagnostic = detail
+          self.verifyAndSendKeys()
+        case .failure(let detail):
+          self.cancelFocusExperiment()
+          self.focusDiagnostic = "AX text focus failed: \(detail)"
+        }
+        self.updateGeometryStatus()
+      }
+    }
+  }
+  func verifyAndSendKeys() {
+    guard !focusPending, !focusKeyChecking, !focusKeys.events.isEmpty,
+      let token = focusToken, let point = focusPoint, let frame = focusFrame,
+      let process = fixture
+    else { return }
+    focusKeyChecking = true
+    let started = ProcessInfo.processInfo.systemUptime
+    let pid = process.processIdentifier
+    axQueue.async { [weak self] in
+      let result = fixtureTextFocus(
+        pid: pid, point: point, expectedFrame: frame, placeCaret: false, token: token)
+      Task { @MainActor [weak self] in
+        guard let self, self.focusToken === token, !token.isCancelled() else { return }
+        self.focusKeyChecking = false
+        guard self.permitted(), self.focusMode, self.probeHasFocus(),
+          self.canvas.sourceRect == frame, ProcessInfo.processInfo.systemUptime - started < 0.5
+        else {
+          self.releaseInput()
+          self.cancelFocusExperiment()
+          self.focusDiagnostic = "AX key check expired or session changed"
+          self.updateGeometryStatus()
+          return
+        }
+        switch result {
+        case .verified(let detail):
+          self.focusDiagnostic = detail
+          for event in self.focusKeys.takeAll() {
+            if event.down {
+              self.postKey(event.code, true, event.flags)
+              self.pressed.keyDown(event.code)
+            } else if self.pressed.keyUp(event.code) {
+              self.postKey(event.code, false, event.flags)
+            }
+          }
+          self.focusKeySnapshot = "key batch: \(self.focusState())"
+        case .failure(let detail):
+          self.releaseInput()
+          self.cancelFocusExperiment()
+          self.focusDiagnostic = "AX key blocked: \(detail)"
+        }
+        self.updateGeometryStatus()
+      }
+    }
   }
   @objc func toggleMouseMode(_ sender: NSButton) {
     releaseInput()
@@ -881,6 +1024,24 @@ final class Canvas: NSView {
   func sendMouse(_ type: CGEventType, _ point: CGPoint?) {
     guard permitted() else {
       releaseInput()
+      if focusMode {
+        cancelFocusExperiment()
+        focusDiagnostic = "AX text input unavailable; click editor to retry"
+        updateGeometryStatus()
+      }
+      return
+    }
+    if focusMode {
+      if type == .leftMouseDown {
+        if let point {
+          startFocusExperiment(point)
+        } else {
+          releaseInput()
+          cancelFocusExperiment()
+          focusDiagnostic = "AX text focus cleared: click outside image"
+          updateGeometryStatus()
+        }
+      }
       return
     }
     if type == .leftMouseUp {
@@ -902,6 +1063,24 @@ final class Canvas: NSView {
     key.postToPid(process.processIdentifier)
   }
   func sendKey(_ event: NSEvent, _ down: Bool) {
+    if focusMode {
+      guard permitted(), probeHasFocus(), focusToken != nil else {
+        releaseInput()
+        cancelFocusExperiment()
+        return
+      }
+      let item = FocusKeyQueue.Event(
+        code: event.keyCode, down: down, flags: UInt64(event.modifierFlags.rawValue))
+      guard focusKeys.append(item) else {
+        releaseInput()
+        cancelFocusExperiment()
+        focusDiagnostic = "AX key queue full; input discarded"
+        updateGeometryStatus()
+        return
+      }
+      verifyAndSendKeys()
+      return
+    }
     if !down {
       if pressed.keyUp(event.keyCode) { postKey(event.keyCode, false) }
       return
