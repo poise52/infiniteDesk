@@ -9,6 +9,7 @@ xcrun swiftc -swift-version 6 -warnings-as-errors -target "$arch-apple-macosx15.
   -module-cache-path "$build/module-cache" -D CAPTURE_TESTING \
   "$root/native/macos/Browser/WindowCapture.swift" \
   "$root/native/macos/Browser/WindowFocus.swift" \
+  "$root/native/macos/Browser/BrowserTextInput.swift" \
   "$root/native/macos/Browser/PickerCoordinator.swift" \
   "$root/native/macos/Browser/Tests/main.swift" -o "$build/capture-test"
 "$build/capture-test"

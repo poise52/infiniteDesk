@@ -90,7 +90,7 @@ private func cgWindows(pid: pid_t) -> [FocusGeometry]? {
   return result
 }
 
-private func matchingWindow(
+func matchingWindow(
   _ identity: WindowFocusIdentity, gate: WindowFocusGate, bundleID: String?
 ) -> (AXUIElement, AXUIElement)? {
   let app = AXUIElementCreateApplication(identity.pid)
@@ -173,6 +173,7 @@ func requestWindowFocus(
       }
       return
     }
+    guard gate.isActive() else { return }
     let raised = AXUIElementPerformAction(currentWindow, kAXRaiseAction as CFString) == .success
     var confirmed = false
     if raised {

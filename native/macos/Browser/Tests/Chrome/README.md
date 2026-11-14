@@ -40,6 +40,25 @@ The visibility and focus readouts are diagnostics for the page only; neither is
 proof that its native window is frontmost. A picker failure, permission failure,
 ambiguous title, or an unsupported system is an inconclusive setup, not a pass.
 
+### Replace a Chrome field from the board
+
+1. With **Chrome A** in front, click **Target text**. Return to InfiniteDesk,
+   select the title bar of its card, and click **Text…**. Check that the
+   identified field is the target. Type `desk-A-проверка` into the board's
+   replacement field and choose **Replace**.
+2. Keep InfiniteDesk in front. In the live preview check both the editable
+   field and the page's **Target value** readout. The field and readout must
+   both equal `desk-A-проверка`, and the decoy must still be `DECOY-A`.
+   Repeat from B using `desk-B-проверка`; verify both the decoy in B and the
+   entire A result are unchanged.
+3. As a negative control start a replacement for A, switch board selection
+   to B, and return to A. The old form must be gone. Neither the selection
+   change nor Escape may edit either page.
+
+Typing directly into the original Chrome window in the focus test above
+does not count as board input. An Accessibility readback alone also does not
+prove Chrome delivered an input event to the page.
+
 Close both fixture windows after testing. Once the disposable-profile Chrome
 process has exited, remove the exact temporary profile directory printed by the
 launcher. Do not remove a profile while its Chrome process is running. `--check`

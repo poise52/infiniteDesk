@@ -72,6 +72,11 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
   let returnToWeb = NSButton(title: "Web", target: nil, action: nil)
   let openApp = NSButton(title: "Open app", target: nil, action: nil)
   let focusWindow = NSButton(title: "Focus window", target: nil, action: nil)
+  let textMode = NSButton(title: "Text…", target: nil, action: nil)
+  let textLabel = NSTextField(labelWithString: "")
+  let textEditor = NSTextField()
+  let textSend = NSButton(title: "Replace", target: nil, action: nil)
+  var textTarget: TextTarget?
   let chromeHeight: CGFloat = 44
   var escapeMonitor: Any?
   var selected = false
@@ -108,6 +113,18 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     openApp.action = #selector(openSourceApplication)
     focusWindow.target = self
     focusWindow.action = #selector(focusSourceWindow)
+    textMode.target = self
+    textMode.action = #selector(beginTextMode)
+    textSend.target = self
+    textSend.action = #selector(sendTextValue)
+    textEditor.placeholderString = "Replacement text"
+    textEditor.setAccessibilityLabel("Replacement text for the selected Chrome field")
+    textEditor.setAccessibilityHelp("Replace writes the entire field value. Escape cancels.")
+    textSend.setAccessibilityHelp("Replace the entire value in the identified Chrome field")
+    textLabel.isHidden = true
+    textEditor.isHidden = true
+    textSend.isHidden = true
+    textMode.isHidden = true
     preview.onActivate = { [weak self] in self?.focusSourceWindow() }
     preview.wantsLayer = true
     preview.layer?.addSublayer(capture.layer)
@@ -121,6 +138,8 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
       self.status.isHidden = false
       self.openApp.isEnabled = self.capture.canOpenApplication
       self.focusWindow.isEnabled = self.capture.canFocusWindow
+      self.textMode.isHidden = !self.capture.canFocusWindow || self.capture.textTarget == nil
+      self.closeTextMode()
       if started {
         self.webView?.isHidden = true
         self.preview.isHidden = false
@@ -143,16 +162,33 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     surface.addSubview(openApp)
     surface.addSubview(focusWindow)
     surface.addSubview(status)
+    surface.addSubview(textMode)
+    surface.addSubview(textLabel)
+    surface.addSubview(textEditor)
+    surface.addSubview(textSend)
     parent.addSubview(clip)
     escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
       let handled = MainActor.assumeIsolated {
-        guard let self, let window = self.parent.window, event.window === window else { return false }
+        guard let self, let window = self.parent.window, event.window === window else {
+          return false
+        }
         if routeFocusShortcut(
           keyCode: event.keyCode, modifiers: event.modifierFlags,
           isRepeat: event.isARepeat, selected: self.selected && !self.preview.isHidden,
           focus: { self.focusSourceWindow() })
-        { return true }
+        {
+          return true
+        }
         guard let responder = window.firstResponder else { return false }
+        let plainEscape =
+          event.keyCode == 53
+          && event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+        if plainEscape && self.textEditor.currentEditor() === responder {
+          self.closeTextMode()
+          self.status.stringValue = "Text editing cancelled."
+          self.status.isHidden = false
+          return true
+        }
         let inBrowser =
           (responder as? NSView)?.isDescendant(of: self.clip) == true
           || self.address.currentEditor() === responder
@@ -212,6 +248,10 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     setFrame(returnToWeb, NSRect(x: 6, y: 7, width: 70, height: 30))
     setFrame(focusWindow, NSRect(x: 80, y: 7, width: 110, height: 30))
     setFrame(openApp, NSRect(x: 194, y: 7, width: 100, height: 30))
+    setFrame(textMode, NSRect(x: 298, y: 7, width: 70, height: 30))
+    setFrame(textLabel, NSRect(x: 8, y: chromeHeight + 6, width: max(1, width - 16), height: 18))
+    setFrame(textEditor, NSRect(x: 8, y: chromeHeight + 28, width: max(1, width - 90), height: 25))
+    setFrame(textSend, NSRect(x: width - 78, y: chromeHeight + 26, width: 70, height: 30))
     if let webView {
       setFrame(webView, NSRect(x: 0, y: chromeHeight, width: width, height: height - chromeHeight))
     }
@@ -256,7 +296,81 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     CATransaction.commit()
   }
 
-  @objc func selectWindow() { capture.selectWindow() }
+  func closeTextMode() {
+    if let editor = textEditor.currentEditor(), parent.window?.firstResponder === editor {
+      parent.window?.makeFirstResponder(parent)
+    }
+    textTarget = nil
+    textEditor.stringValue = ""
+    textLabel.isHidden = true
+    textEditor.isHidden = true
+    textSend.isHidden = true
+  }
+  @objc func beginTextMode() {
+    guard selected, NSApp.isActive, parent.window?.isKeyWindow == true else {
+      status.stringValue = "Select this card before choosing a text field."
+      status.isHidden = false
+      return
+    }
+    guard textAccessibilityAvailable() else {
+      status.stringValue = "Accessibility access is unavailable for InfiniteDesk."
+      status.isHidden = false
+      return
+    }
+    guard let (identity, app) = capture.textTarget else {
+      status.stringValue = "A live Chrome window capture is required."
+      status.isHidden = false
+      return
+    }
+    capture.cancelPendingFocus()
+    closeTextMode()
+    let gate = WindowTextGate()
+    capture.textGate = gate
+    status.stringValue = "Checking Chrome's focused field…"
+    status.isHidden = false
+    inspectTextTarget(identity: identity, app: app, gate: gate) { [weak self] target in
+      guard let self, self.selected, self.capture.textGate === gate else { return }
+      guard let target else {
+        self.status.stringValue = "Focus an editable page field in Chrome, then return and retry."
+        return
+      }
+      self.textTarget = target
+      self.textLabel.stringValue = "Replace entire value in: \(target.title)"
+      self.textLabel.isHidden = false
+      self.textEditor.isHidden = false
+      self.textSend.isHidden = false
+      self.status.stringValue = "Text replaces the whole field."
+      self.parent.window?.makeFirstResponder(self.textEditor)
+    }
+  }
+  @objc func sendTextValue() {
+    guard selected, NSApp.isActive, parent.window?.isKeyWindow == true,
+      let expected = textTarget, let (identity, app) = capture.textTarget
+    else {
+      closeTextMode()
+      return
+    }
+    let value = textEditor.stringValue
+    guard !value.isEmpty else {
+      status.stringValue = "Enter replacement text; empty values are not sent."
+      status.isHidden = false
+      return
+    }
+    capture.cancelPendingFocus()
+    let gate = WindowTextGate()
+    capture.textGate = gate
+    closeTextMode()
+    sendText(identity: identity, app: app, gate: gate, expected: expected, text: value) {
+      [weak self] message in
+      guard let self, self.capture.textGate === gate else { return }
+      self.status.stringValue = message
+      self.status.isHidden = false
+    }
+  }
+  @objc func selectWindow() {
+    closeTextMode()
+    capture.selectWindow()
+  }
   @objc func openSourceApplication() { capture.openApplication() }
   @objc func focusSourceWindow() {
     guard capture.canFocusWindow else {
@@ -270,6 +384,8 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     }
   }
   @objc func showWeb() {
+    closeTextMode()
+    textMode.isHidden = true
     capture.stop()
     let isNew = webView == nil
     if isNew {
@@ -426,7 +542,10 @@ public func deskBrowserSetSelected(_ pointer: UnsafeMutableRawPointer?, _ select
   MainActor.assumeIsolated {
     guard let raw = UnsafeMutableRawPointer(bitPattern: address) else { return }
     let browser = Unmanaged<Browser>.fromOpaque(raw).takeUnretainedValue()
-    if browser.selected && selected != 1 { browser.capture.cancelPendingFocus() }
+    if browser.selected && selected != 1 {
+      browser.capture.cancelPendingFocus()
+      browser.closeTextMode()
+    }
     browser.selected = selected == 1
   }
 }

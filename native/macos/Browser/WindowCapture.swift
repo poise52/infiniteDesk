@@ -79,6 +79,7 @@ final class WindowCapture: NSObject, SCStreamDelegate {
   private var selectedApp: NSRunningApplication?
   private var selectedWindow: WindowFocusIdentity?
   private var focusGate: WindowFocusGate?
+  var textGate: WindowTextGate?
   private var focusTransition = false
   private var pendingStream: SCStream?
   private var pendingFrame: CGImage?
@@ -137,8 +138,7 @@ final class WindowCapture: NSObject, SCStreamDelegate {
   }
 
   private func updateExisting(_ stream: SCStream, filter: SCContentFilter) {
-    focusGate?.cancel()
-    focusGate = nil
+    cancelPendingFocus()
     focusTransition = true
     generation += 1
     let token = generation
@@ -260,7 +260,16 @@ final class WindowCapture: NSObject, SCStreamDelegate {
     !picking && !focusTransition && selectedWindow != nil && selectedApp != nil && stream != nil
   }
 
+  var textTarget: (WindowFocusIdentity, NSRunningApplication)? {
+    guard canFocusWindow, let selectedWindow, let selectedApp,
+      selectedApp.bundleIdentifier == "com.google.Chrome"
+    else { return nil }
+    return (selectedWindow, selectedApp)
+  }
+
   func cancelPendingFocus() {
+    textGate?.cancel()
+    textGate = nil
     focusGate?.cancel()
     focusGate = nil
   }
@@ -304,8 +313,7 @@ final class WindowCapture: NSObject, SCStreamDelegate {
     selectedApp = nil
     selectedWindow = nil
     focusTransition = false
-    focusGate?.cancel()
-    focusGate = nil
+    cancelPendingFocus()
     pendingStream = nil
     pendingFrame = nil
     clearLayer()
@@ -331,7 +339,12 @@ final class WindowCapture: NSObject, SCStreamDelegate {
       }
     } else if status == .blank || status == .stopped {
       if pendingStream === stream { pendingFrame = nil }
-      if self.stream === stream { clearLayer() }
+      if self.stream === stream {
+        cancelPendingFocus()
+        selectedWindow = nil
+        clearLayer()
+        onUpdate?("Capture is blank or stopped; select the window again.", false)
+      }
     }
   }
 
@@ -354,8 +367,7 @@ final class WindowCapture: NSObject, SCStreamDelegate {
       self.selectedApp = nil
       self.selectedWindow = nil
       self.focusTransition = false
-      self.focusGate?.cancel()
-      self.focusGate = nil
+      self.cancelPendingFocus()
       self.clearLayer()
       self.releasePickerIfIdle()
       self.onUpdate?("Capture stopped: \(message)", false)

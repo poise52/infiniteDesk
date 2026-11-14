@@ -30,14 +30,27 @@ pixels. On macOS 15.2 or later, **Focus window** or ⌘Return with a captured
 card selected asks macOS to bring the original window forward. This requires
 Accessibility access and can fail when the window cannot be identified
 uniquely. **Open app** activates the source application without choosing
-between its windows. Typing and clicking in an external app take place in
-the original window; the live image does not forward mouse or keyboard input.
+between its windows. The live image does not forward clicks or keystrokes.
+
+For a captured Google Chrome window, **Text…** offers an experimental way
+to replace the value of an ordinary text field without leaving the board.
+Focus the field on the page in Chrome first. Return to InfiniteDesk, select
+that card by its title bar, and click **Text…**. Check the field name, enter
+the replacement, and click **Replace**. Escape cancels. The command replaces
+the entire value and requires Accessibility access; it does not target the
+address bar or password fields. It rechecks the focused window and field
+before writing. A successful readback confirms the Accessibility value;
+check the page itself for input events and application-specific behavior.
 
 Run `native/macos/Browser/Tests/run.sh` in a graphical macOS session to check
 two independent capture streams. `native/macos/Browser/Tests/Focus/run.sh`
 checks identity matching and self-focus rejection without opening windows.
 Pass `--integration` to check focus between two windows of a separate test
 process. It skips with status 77 if the test host lacks Accessibility access.
+See [the two-window Chrome test](native/macos/Browser/Tests/Chrome/README.md)
+to distinguish switching the original window from editing its page from the
+board. Run `native/macos/Browser/Tests/Text/run.sh` for the role and
+cancellation checks without a graphical session.
 
 Install the optional verification tools with:
 
