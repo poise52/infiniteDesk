@@ -10,6 +10,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var statusItem: NSStatusItem?
   private let menu = NSMenu()
   private var hotkeys: DesktopHotkeys?
+  private var panInput: DesktopPanInput?
   private var menuApplication: DesktopApplicationSnapshot?
   private var selectedID: UUID?
   private var cycleCursorID: UUID?
@@ -20,6 +21,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   private var trusted = DesktopWindowClient.accessibilityTrusted
   private var status = "Register a focused window to begin."
   private var shortcutWarning: String?
+  private var panWarning: String?
   private var terminating = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
@@ -44,6 +46,17 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     self.hotkeys = hotkeys
     shortcutWarning = hotkeys.start()
+    let panInput = DesktopPanInput(enabled: { [weak self] in
+      guard let self else { return false }
+      return self.trusted && !self.terminating && !self.client.camera.paused
+        && self.client.camera.recoveryCount == 0 && !self.client.windows.isEmpty
+    }, authorize: { [weak self] in self?.requirePermission() ?? false },
+    action: { [weak self] packet in self?.pan(packet) }, statusChanged: { [weak self] warning in
+      self?.panWarning = warning
+      self?.updateStatus()
+    })
+    self.panInput = panInput
+    panInput.start()
     modelDidChange()
     updateStatus()
   }
@@ -53,6 +66,8 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     testState?.stop()
     hotkeys?.stop()
     hotkeys = nil
+    panInput?.stop()
+    panInput = nil
     client.close()
   }
 
@@ -89,6 +104,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
   func menuWillOpen(_ menu: NSMenu) {
     menuApplication = externalApplication()
     checkPermission()
+    panInput?.checkHealth()
     rebuildMenu()
   }
 
@@ -101,7 +117,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
       }
     }
     testState?.publish(windows: client.windows, focusedID: client.focusedID,
-      camera: client.camera, busy: client.isCameraBusy)
+      camera: client.camera, busy: client.isCameraBusy, pan: client.panMetrics)
     updateStatus()
   }
 
@@ -118,11 +134,14 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     trusted = current
     client.setAccessibilityTrusted(current)
     if !current {
+      panInput?.stop()
+      panWarning = "Continuous pan stopped: Accessibility permission is required."
       client.cancel()
       cycleCursorID = nil
       pendingFocusID = nil
       status = "Accessibility permission is required."
     } else {
+      panInput?.start()
       status = "Accessibility enabled. Register a focused window."
     }
     updateStatus()
@@ -247,9 +266,29 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
   }
 
+  private func pan(_ packet: DesktopPanPacket) {
+    guard trusted, !terminating, !client.camera.paused, client.camera.recoveryCount == 0 else { return }
+    cycleCursorID = nil
+    client.panCamera(by: packet.delta, ended: packet.ended) { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .success:
+        if packet.ended { self.status = "Workspace panned. Ordinary typing and scrolling stay in the active app." }
+      case .failure(.cameraInputCoalesced): return
+      case .failure(let error): self.status = error.localizedDescription
+      }
+      self.updateStatus()
+    }
+  }
+
   private func togglePause() {
+    guard !terminating else { return }
+    if client.camera.paused, client.camera.recoveryCount > 0, !client.camera.requiresRestoration {
+      recoverInterruptedSession()
+      return
+    }
     guard requirePermission() else { return }
-    let pause = !client.camera.paused || client.windows.contains(where: { $0.managerMinimized })
+    let pause = client.isCameraBusy || !client.camera.paused || client.camera.requiresRestoration
     cycleCursorID = nil
     status = pause ? "Restoring managed windows and pausing…" : "Resuming workspace…"
     updateStatus()
@@ -299,9 +338,9 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     append(trusted ? "Accessibility: enabled" : "Accessibility: permission required", enabled: false)
     let camera = client.camera
     let cameraGeometry = String(format: "%.0f, %.0f", camera.origin.x, camera.origin.y)
-    let hasParkedWindows = client.windows.contains(where: { $0.managerMinimized })
+    let requiresRestoration = camera.requiresRestoration
     append(camera.paused ? (camera.recoveryCount > 0 ? "Workspace: paused · interrupted session needs recovery"
-      : hasParkedWindows ? "Workspace: paused · parked windows need restoration"
+      : requiresRestoration ? "Workspace: paused · managed windows need restoration"
       : "Workspace: paused · managed windows released")
       : "Workspace page \(camera.page) · camera \(cameraGeometry) pt · 1:1", enabled: false)
     if let detail = camera.detail { append(detail, enabled: false).toolTip = detail }
@@ -321,6 +360,10 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
       let warning = append(shortcutWarning, enabled: false)
       warning.toolTip = shortcutWarning
     }
+    if let panWarning {
+      let warning = append(panWarning, enabled: false)
+      warning.toolTip = panWarning
+    }
     menu.addItem(.separator())
     let available = trusted && !terminating && !client.isCameraBusy
     let workspaceAvailable = available && camera.recoveryCount == 0
@@ -337,10 +380,12 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
       enabled: workspaceAvailable && !camera.paused, shortcut: .previousPage)
     append("Next workspace page", action: #selector(nextPageFromMenu),
       enabled: workspaceAvailable && !camera.paused, shortcut: .nextPage)
-    let pauseTitle = camera.paused ? (hasParkedWindows ? "Restore parked windows" : "Resume workspace")
+    append("Pan: hold ⌥⌘ and drag left/right", enabled: false)
+    append("Mouse / trackpad: hold ⌃⌥⌘ and scroll", enabled: false)
+    let pauseTitle = camera.paused ? (requiresRestoration ? "Restore managed windows" : "Resume workspace")
       : "Pause and restore windows"
     append(pauseTitle, action: #selector(pauseFromMenu),
-      enabled: available && (hasParkedWindows || camera.recoveryCount == 0), shortcut: .pause)
+      enabled: trusted && !terminating && (requiresRestoration || camera.recoveryCount == 0), shortcut: .pause)
     menu.addItem(.separator())
     if client.windows.isEmpty {
       append("No registered windows", enabled: false)
@@ -367,7 +412,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     menu.addItem(.separator())
     append("Request Accessibility permission…", action: #selector(requestPermission), enabled: !trusted)
     append("Open Accessibility settings…", action: #selector(openAccessibility))
-    append("Retry global shortcuts", action: #selector(retryShortcuts))
+    append("Retry global input", action: #selector(retryShortcuts))
     menu.addItem(.separator())
     append("Restore windows and quit InfiniteDesk", action: #selector(quit), enabled: !terminating)
   }
@@ -475,7 +520,9 @@ final class DesktopApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
   }
   @objc private func retryShortcuts() {
+    checkPermission()
     shortcutWarning = hotkeys?.start()
+    panInput?.start()
     updateStatus()
   }
   @objc private func quit() { NSApp.terminate(nil) }

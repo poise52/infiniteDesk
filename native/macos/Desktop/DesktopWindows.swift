@@ -72,10 +72,12 @@ func desktopLaunchDatesCompatible(expected: Date?, actual: Date?) -> Bool {
 enum DesktopWindowError: LocalizedError, Sendable {
   case message(String)
   case focusUnconfirmed
+  case cameraInputCoalesced
 
   var errorDescription: String? {
     switch self {
     case .message(let text): return text
+    case .cameraInputCoalesced: return "Camera input was coalesced into a newer packet."
     case .focusUnconfirmed: return "Could not confirm keyboard focus on the exact selected window."
     }
   }
@@ -165,6 +167,8 @@ private struct DesktopWindowRecord {
   var snapshot: DesktopWindow
   var lastPhysicalFrame: CGRect?
   var cameraScopeEligible = false
+  var positionManaged = false
+  var intendedPhysicalFrame: CGRect?
 }
 
 // All access to records and AX handles is confined to queue. Only DTOs cross its boundary.
@@ -188,7 +192,10 @@ final class DesktopWindowBackend: @unchecked Sendable {
   private var cameraJournal: DesktopCameraJournal?
   private var cameraJournalLoaded = false
   private var cameraScopeInvalid = false
+  private var continuousCamera = false
   private let onCurrentSpace: @Sendable (pid_t, CGRect) -> Bool
+  private let applicationIsActive: @Sendable (pid_t) -> Bool
+  private let userInputGeneration: @Sendable () -> UInt64
   private var lastPublishedCamera = DesktopCameraSnapshot()
   private var pageFocus: [Int: UUID] = [:]
   private static let cameraLogger = Logger(subsystem: "dev.infinitedesk.desktop", category: "camera")
@@ -207,6 +214,14 @@ final class DesktopWindowBackend: @unchecked Sendable {
     permissionCheck: @escaping @Sendable () -> Bool = { AXIsProcessTrusted() },
     cameraJournal: DesktopCameraJournal? = nil,
     onCurrentSpace: @escaping @Sendable (pid_t, CGRect) -> Bool = { desktopWindowOnCurrentSpace(pid: $0, frame: $1) },
+    applicationIsActive: @escaping @Sendable (pid_t) -> Bool = {
+      NSRunningApplication(processIdentifier: $0)?.isActive == true
+    },
+    userInputGeneration: @escaping @Sendable () -> UInt64 = {
+      [CGEventType.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown].reduce(UInt64(0)) {
+        $0 &+ UInt64(CGEventSource.counterForEventType(.combinedSessionState, eventType: $1))
+      }
+    },
     processIdentity: @escaping @Sendable (pid_t) -> DesktopProcessIdentity? = {
       DesktopProcessIdentity.read(pid: $0)
     }
@@ -214,6 +229,8 @@ final class DesktopWindowBackend: @unchecked Sendable {
     self.access = access
     self.cameraJournal = cameraJournal
     self.onCurrentSpace = onCurrentSpace
+    self.applicationIsActive = applicationIsActive
+    self.userInputGeneration = userInputGeneration
     self.observationProvider = observationProvider
     self.permissionCheck = permissionCheck
     self.processIdentity = processIdentity
@@ -413,8 +430,8 @@ final class DesktopWindowBackend: @unchecked Sendable {
 
   @discardableResult
   func remove(id: UUID) -> Bool {
-    if records[id]?.snapshot.managerMinimized == true {
-      do { try setManagerMinimized(id: id, minimized: false, operation: DesktopOperation()) }
+    if records[id]?.snapshot.managerMinimized == true || records[id]?.positionManaged == true {
+      do { try restoreManagedWindow(id: id, operation: DesktopOperation()) }
       catch {
         camera.detail = "Cannot forget a parked window: \(error.localizedDescription)"
         publish()
@@ -433,8 +450,8 @@ final class DesktopWindowBackend: @unchecked Sendable {
   }
 
   func removeAll() {
-    for id in registrationOrder where records[id]?.snapshot.managerMinimized == true {
-      do { try setManagerMinimized(id: id, minimized: false, operation: DesktopOperation()) }
+    for id in registrationOrder where records[id]?.snapshot.managerMinimized == true || records[id]?.positionManaged == true {
+      do { try restoreManagedWindow(id: id, operation: DesktopOperation()) }
       catch {
         camera.paused = true
         camera.detail = "Shutdown recovery retained: \(error.localizedDescription)"
@@ -457,6 +474,7 @@ final class DesktopWindowBackend: @unchecked Sendable {
 @MainActor
 final class DesktopWindowClient {
   private let backend: DesktopWindowBackend
+  private let displayProvider: @MainActor @Sendable () -> DesktopCameraDisplay?
   private var operation: DesktopOperation?
   private var timeout: DispatchWorkItem?
   private var applications: [UUID: DesktopApplicationSnapshot] = [:]
@@ -466,12 +484,18 @@ final class DesktopWindowClient {
   private(set) var focusedID: UUID?
   private(set) var camera = DesktopCameraSnapshot()
   private(set) var isCameraBusy = false
+  private(set) var panMetrics: DesktopPanMetrics? = {
+    let environment = ProcessInfo.processInfo.environment
+    return environment["INFINITEDESK_TEST_STATE_PATH"] != nil || environment["INFINITEDESK_PAN_METRICS"] == "1" ? DesktopPanMetrics() : nil
+  }()
   var onChange: (@MainActor @Sendable () -> Void)?
   private var lastRevision: UInt64 = 0
   private var workspaceTokens: [NSObjectProtocol] = []
   private var screenToken: NSObjectProtocol?
   private var cameraOperation: DesktopOperation?
   private var queuedCameraMove: (delta: Int, completion: @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void)?
+  private var queuedPan: (delta: CGFloat, ended: Bool, completion: @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void)?
+  private var queuedPause: (@MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void)?
   private var queuedQuit: (@MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void)?
   var recoveryInstructions: String { camera.recoveryInstructions ?? camera.detail ?? "No interrupted window changes require recovery." }
 
@@ -482,8 +506,12 @@ final class DesktopWindowClient {
     return window.observationDetail ?? "Accessibility notifications: \(window.observationStatus.rawValue)."
   }
 
-  init(backend: DesktopWindowBackend = DesktopWindowBackend()) {
+  init(
+    backend: DesktopWindowBackend = DesktopWindowBackend(),
+    displayProvider: @escaping @MainActor @Sendable () -> DesktopCameraDisplay? = { DesktopCameraDisplay.current() }
+  ) {
     self.backend = backend
+    self.displayProvider = displayProvider
     let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier
     let trusted = Self.accessibilityTrusted
     backend.queue.async { [weak self] in
@@ -704,7 +732,7 @@ final class DesktopWindowClient {
       return
     }
     let backend = backend
-    let display = DesktopCameraDisplay.current()
+    let display = displayProvider()
     backend.queue.async { [weak self] in
       do {
         try backend.reveal(id: id, display: display, operation: operation)
@@ -840,6 +868,7 @@ extension DesktopWindowBackend {
   }
 
   private func publish() {
+    camera.requiresRestoration = records.values.contains { $0.snapshot.managerMinimized || $0.positionManaged }
     let windows = registrationOrder.compactMap { records[$0]?.snapshot ?? closedWindows[$0] }
     guard windows != lastPublishedWindows || currentFocusedID != lastPublishedFocus || camera != lastPublishedCamera else { return }
     revision += 1
@@ -1009,7 +1038,7 @@ extension DesktopWindowBackend {
     detachObservation(id: id)
     records.removeValue(forKey: id)
     pendingRegistrations.removeValue(forKey: id)
-    if snapshot.managerMinimized {
+    if snapshot.managerMinimized || cameraJournal?.entries.contains(where: { $0.id == id }) == true {
       do { try cameraJournal?.complete(id: id) }
       catch {
         camera.recoveryCount = cameraJournal?.entries.count ?? 1
@@ -1028,10 +1057,40 @@ extension DesktopWindowBackend {
   }
 
   private func updateGeometry(id: UUID, frame: CGRect) {
-    guard records[id]?.snapshot.availability != .closed else { return }
-    guard records[id]?.snapshot.managerMinimized != true else { return }
+    guard let record = records[id], record.snapshot.availability != .closed,
+      !record.snapshot.managerMinimized else { return }
+    if let previous = record.lastPhysicalFrame, desktopFramesEqual(previous, frame, tolerance: 0.01) {
+      records[id]?.snapshot.availability = .available
+      return
+    }
+    if continuousCamera, camera.paused {
+      if !record.positionManaged, let previous = record.lastPhysicalFrame {
+        records[id]?.snapshot.worldFrame = record.snapshot.worldFrame.offsetBy(dx: frame.minX - previous.minX, dy: frame.minY - previous.minY)
+        records[id]?.snapshot.worldFrame.size = frame.size
+        records[id]?.lastPhysicalFrame = frame
+      }
+      return
+    }
+    if record.positionManaged {
+      if let intended = record.intendedPhysicalFrame, desktopFramesEqual(intended, frame, tolerance: 0.01) {
+        records[id]?.lastPhysicalFrame = frame
+        records[id]?.snapshot.availability = .available
+        return
+      }
+    }
+    if record.positionManaged {
+      do { try cameraJournal?.checkpointRestorable(id: id, frame: frame, minimized: false) }
+      catch {
+        camera.paused = true
+        camera.detail = "Camera paused while saving the moved window: \(error.localizedDescription)"
+        return
+      }
+    }
     records[id]?.lastPhysicalFrame = frame
-    let origin = cameraDisplay?.origin(page: records[id]?.snapshot.cameraPage ?? camera.page) ?? camera.origin
+    // Pause releases physical positions while retaining the virtual layout.
+    guard !continuousCamera || !camera.paused else { return }
+    let origin = continuousCamera ? camera.origin
+      : (cameraDisplay?.origin(page: record.snapshot.cameraPage) ?? camera.origin)
     records[id]?.snapshot.worldFrame = frame.offsetBy(dx: origin.x, dy: origin.y)
     records[id]?.snapshot.availability = .available
   }
@@ -1074,9 +1133,11 @@ extension DesktopWindowBackend {
       {
         let physical = try frame(record.window, operation)
         if onCurrentSpace(record.application.pid, physical) {
-          try cameraJournal?.complete(id: id)
+          if !record.positionManaged { try cameraJournal?.complete(id: id) }
           records[id]?.snapshot.managerMinimized = false
           records[id]?.snapshot.cameraPage = camera.page
+          records[id]?.lastPhysicalFrame = nil
+          records[id]?.intendedPhysicalFrame = nil
           updateGeometry(id: id, frame: physical)
         }
       }
@@ -1141,7 +1202,7 @@ extension DesktopWindowBackend {
   }
 
   private func refreshPendingRecovery() {
-    let unresolved = (cameraJournal?.entries ?? []).filter { records[$0.id]?.snapshot.managerMinimized != true }
+    let unresolved = (cameraJournal?.entries ?? []).filter { records[$0.id]?.snapshot.managerMinimized != true && records[$0.id]?.positionManaged != true }
     camera.recoveryCount = unresolved.count
     camera.recoveryInstructions = unresolved.isEmpty ? nil : DesktopCameraRecovery.inspect(unresolved, processIdentity: processIdentity)
       .map(\.instructions).joined(separator: "\n\n")
@@ -1149,7 +1210,7 @@ extension DesktopWindowBackend {
 
   private func reconcileCameraJournal(operation: DesktopOperation) throws {
     guard let journal = cameraJournal else { return }
-    for entry in journal.entries where records[entry.id]?.snapshot.managerMinimized != true {
+    for entry in journal.entries where records[entry.id]?.snapshot.managerMinimized != true && records[entry.id]?.positionManaged != true {
       guard let record = records[entry.id], record.application.pid == entry.pid,
         record.application.processIdentity == entry.processIdentity else { continue }
       let minimized = try validateCameraIdentity(record, operation)
@@ -1233,15 +1294,17 @@ extension DesktopWindowBackend {
             // A Dock click or external deminiaturization is an explicit user takeover.
             let physical = try frame(record.window, operation)
             guard onCurrentSpace(record.application.pid, physical) else { continue }
-            try cameraJournal?.complete(id: id)
+            if !record.positionManaged { try cameraJournal?.complete(id: id) }
             records[id]?.snapshot.managerMinimized = false
             records[id]?.snapshot.cameraPage = camera.page
+            records[id]?.lastPhysicalFrame = nil
+            records[id]?.intendedPhysicalFrame = nil
             updateGeometry(id: id, frame: physical)
           }
         } else {
           guard !minimized else { continue }
           let physical = try frame(record.window, operation)
-          guard onCurrentSpace(record.application.pid, physical) else { continue }
+          guard record.positionManaged || onCurrentSpace(record.application.pid, physical) else { continue }
           updateGeometry(id: id, frame: physical)
         }
       } catch {
@@ -1304,10 +1367,10 @@ extension DesktopWindowBackend {
           throw DesktopWindowError.message("The window is minimized by its owner or outside the current Space.")
         }
         phase = "journal-prepare"
-        try journal.prepare(DesktopCameraJournalEntry(
+        if !record.positionManaged { try journal.prepare(DesktopCameraJournalEntry(
           id: id, pid: record.application.pid, processIdentity: record.application.processIdentity,
           title: record.snapshot.title, appName: record.snapshot.appName,
-          bundleIdentifier: record.application.bundleIdentifier, originalFrame: physical))
+          bundleIdentifier: record.application.bundleIdentifier, originalFrame: physical)) }
         records[id]?.lastPhysicalFrame = physical
       }
       let target = records[id]?.lastPhysicalFrame ?? physical
@@ -1328,13 +1391,13 @@ extension DesktopWindowBackend {
           throw DesktopWindowError.message("The application refused minimization (AX \(status.rawValue)).")
         }
         phase = "confirm-minimized"
-        try confirmCameraMutation(record, minimized: minimized, restoredFrame: minimized ? nil : target, operation: operation)
+        try confirmCameraMutation(record, minimized: minimized, restoredFrame: minimized || record.positionManaged ? nil : target, operation: operation)
       }
       if !minimized {
         phase = "confirm-restored-frame"
-        try confirmCameraMutation(record, minimized: false, restoredFrame: target, operation: operation)
+        try confirmCameraMutation(record, minimized: false, restoredFrame: record.positionManaged ? nil : target, operation: operation)
         phase = "journal-complete"
-        do { try journal.complete(id: id) }
+        do { if !record.positionManaged { try journal.complete(id: id) } }
         catch {
           records[id]?.snapshot.managerMinimized = false
           refreshPendingRecovery()
@@ -1351,6 +1414,205 @@ extension DesktopWindowBackend {
     }
   }
 
+  private func savePositionOwnership(id: UUID, physicalFrame: CGRect?, operation: DesktopOperation) throws {
+    guard let record = records[id], !record.positionManaged else { return }
+    guard let journal = cameraJournal else { throw DesktopWindowError.message("The recovery journal is unavailable.") }
+    let physical = try physicalFrame ?? frame(record.window, operation)
+    try journal.preparePosition(DesktopCameraJournalEntry(
+      id: id, pid: record.application.pid, processIdentity: record.application.processIdentity,
+      title: record.snapshot.title, appName: record.snapshot.appName,
+      bundleIdentifier: record.application.bundleIdentifier, originalFrame: physical))
+    records[id]?.positionManaged = true
+    records[id]?.lastPhysicalFrame = physical
+  }
+
+  private func writePosition(id: UUID, target: CGRect, operation: DesktopOperation) throws -> CGRect {
+    guard let record = records[id], let writer = access as? any DesktopCameraAXAccess,
+      writer.settable(record.window, kAXPositionAttribute) else {
+      throw DesktopWindowError.message("This window does not allow native position changes.")
+    }
+    _ = try validateCameraIdentity(record, operation)
+    try operation.check()
+    var point = target.origin
+    guard let value = AXValueCreate(.cgPoint, &point) else {
+      throw DesktopWindowError.message("Cannot encode the native window position.")
+    }
+    records[id]?.intendedPhysicalFrame = target
+    let status = writer.set(record.window, kAXPositionAttribute, value)
+    try operation.check()
+    guard status == .success || status == .cannotComplete else {
+      throw DesktopWindowError.message("The application refused the native position (AX \(status.rawValue)).")
+    }
+    let physical = try frame(record.window, operation)
+    records[id]?.lastPhysicalFrame = physical
+    if status == .cannotComplete, !desktopFramesEqual(physical, target) {
+      throw DesktopWindowError.message("The native position reply was uncertain and readback did not confirm it.")
+    }
+    return physical
+  }
+
+  private func restoreManagedWindow(id: UUID, operation: DesktopOperation) throws {
+    guard let record = records[id] else { return }
+    if record.snapshot.managerMinimized {
+      try setManagerMinimized(id: id, minimized: false, operation: operation)
+    }
+    guard record.positionManaged, let journal = cameraJournal,
+      let entry = journal.entries.first(where: { $0.id == id }) else { return }
+    guard try validateCameraIdentity(record, operation) == false else {
+      throw DesktopWindowError.message("A user-minimized window requires manual restoration.")
+    }
+    let current = try frame(record.window, operation)
+    if !desktopFramesEqual(current, entry.restorationFrame) {
+      let actual = try writePosition(id: id, target: entry.restorationFrame, operation: operation)
+      guard desktopFramesEqual(actual, entry.restorationFrame) else {
+        throw DesktopWindowError.message("macOS constrained the recovery position; restore this window manually.")
+      }
+    }
+    records[id]?.lastPhysicalFrame = try frame(record.window, operation)
+    try journal.complete(id: id)
+    records[id]?.positionManaged = false
+    records[id]?.intendedPhysicalFrame = nil
+    records[id]?.snapshot.managerMinimized = false
+    records[id]?.snapshot.availability = .available
+  }
+
+  func panCamera(by delta: CGFloat, ended: Bool = false, display: DesktopCameraDisplay?, operation: DesktopOperation) throws -> DesktopCameraSnapshot {
+    let display = try ensureCamera(display: display, operation: operation)
+    guard !camera.paused else { throw DesktopWindowError.message("Resume the camera before panning.") }
+    let target = camera.origin.x + delta
+    guard delta.isFinite, target.isFinite, abs(target / display.frame.width) <= 100_000 else {
+      throw DesktopWindowError.message("The requested camera position is outside the supported range.")
+    }
+    if delta == 0 {
+      camera.focusTargetID = nil
+      if ended { _ = try cameraCandidates(operation: operation); publish() }
+      return camera
+    }
+    continuousCamera = true
+    return try applyContinuousCamera(origin: target, display: display, operation: operation)
+  }
+
+  private struct UnparkFocus {
+    let previousID: UUID
+    let arrivingID: UUID
+    let inputGeneration: UInt64
+  }
+
+  private func focusBeforeUnpark(
+    id: UUID, origin: CGFloat, display: DesktopCameraDisplay, operation: DesktopOperation
+  ) throws -> UnparkFocus? {
+    let generation = userInputGeneration()
+    guard let arriving = records[id], arriving.snapshot.managerMinimized,
+      frontmostPID == arriving.application.pid, applicationIsActive(arriving.application.pid),
+      let focused = try read(arriving.app, kAXFocusedWindowAttribute, operation)
+    else { return nil }
+    guard let previousID = registrationOrder.first(where: { candidate in
+      guard candidate != id, let previous = records[candidate],
+        previous.application.pid == arriving.application.pid,
+        previous.application.processIdentity == arriving.application.processIdentity,
+        previous.cameraScopeEligible, !previous.snapshot.managerMinimized,
+        let physical = previous.lastPhysicalFrame, physical.intersects(display.frame),
+        previous.snapshot.worldFrame.offsetBy(dx: -origin, dy: 0).intersects(display.frame)
+      else { return false }
+      return CFEqual(previous.window, focused)
+    }) else { return nil }
+    guard userInputGeneration() == generation else { return nil }
+    return UnparkFocus(previousID: previousID, arrivingID: id, inputGeneration: generation)
+  }
+
+  private func preserveUnparkFocus(_ saved: UnparkFocus?, operation: DesktopOperation) throws {
+    guard let saved, let previous = records[saved.previousID], let arriving = records[saved.arrivingID] else { return }
+    func stillOwned() throws -> Bool {
+      guard frontmostPID == previous.application.pid, applicationIsActive(previous.application.pid),
+        userInputGeneration() == saved.inputGeneration,
+        let focused = try read(previous.app, kAXFocusedWindowAttribute, operation)
+      else { return false }
+      return CFEqual(focused, arriving.window)
+    }
+    guard try stillOwned(), try validateCameraIdentity(previous, operation) == false,
+      try stillOwned() else { return }
+    // Deminiaturization can focus its own arrival. Restore only the exact displaced sibling;
+    // never activate a process or follow a subsequent user/application focus change.
+    let status = access.perform(previous.window, kAXRaiseAction)
+    try operation.check()
+    guard status == .success || status == .cannotComplete else {
+      throw DesktopWindowError.message("Could not preserve the focused window after native restoration.")
+    }
+    if let focused = try read(previous.app, kAXFocusedWindowAttribute, operation), CFEqual(focused, previous.window) {
+      currentFocusedID = saved.previousID
+      return
+    }
+    guard try stillOwned() else { return }
+    guard access.mainSettable(previous.window) else {
+      throw DesktopWindowError.message("The displaced sibling does not allow restoring native Main focus.")
+    }
+    guard try stillOwned() else { return }
+    let mainStatus = access.makeMain(previous.window)
+    try operation.check()
+    guard mainStatus == .success || mainStatus == .cannotComplete else {
+      throw DesktopWindowError.message("Could not restore Main to the selected sibling after native restoration.")
+    }
+    if let focused = try read(previous.app, kAXFocusedWindowAttribute, operation), CFEqual(focused, previous.window) {
+      currentFocusedID = saved.previousID
+    } else if try stillOwned() {
+      throw DesktopWindowError.message("Native restoration displaced keyboard focus and the selected sibling could not regain it.")
+    }
+  }
+
+  private func applyContinuousCamera(
+    origin: CGFloat, display: DesktopCameraDisplay, operation: DesktopOperation, focusArrival: Bool = false
+  ) throws -> DesktopCameraSnapshot {
+    do {
+      let ids = try cameraCandidates(operation: operation)
+      guard !camera.paused else { throw DesktopWindowError.message(camera.detail ?? "Camera restoration is required.") }
+      if let currentFocusedID, let focused = records[currentFocusedID] {
+        pageFocus[focused.snapshot.cameraPage] = currentFocusedID
+      }
+      var constrained = false
+      // Every mutation is performed on this queue. Save originals before the first position IPC.
+      for id in ids {
+        guard let record = records[id] else { continue }
+        let target = record.snapshot.worldFrame.offsetBy(dx: -origin, dy: 0)
+        let visible = target.maxX > display.frame.minX && target.minX < display.frame.maxX
+        if !visible {
+          if !record.snapshot.managerMinimized { try setManagerMinimized(id: id, minimized: true, operation: operation) }
+          continue
+        }
+        // Candidates already validated scope/identity and sampled each visible frame on this queue.
+        // A parked arrival needs a fresh frame after its deminiaturization instead.
+        let sampledFrame = record.snapshot.managerMinimized ? nil : record.lastPhysicalFrame
+        try savePositionOwnership(id: id, physicalFrame: sampledFrame, operation: operation)
+        if record.snapshot.managerMinimized {
+          let savedFocus = try focusBeforeUnpark(id: id, origin: origin, display: display, operation: operation)
+          try setManagerMinimized(id: id, minimized: false, operation: operation)
+          try preserveUnparkFocus(savedFocus, operation: operation)
+        }
+        let current = try sampledFrame ?? frame(record.window, operation)
+        if !desktopFramesEqual(current, target, tolerance: 0.01) {
+          let physical = try writePosition(id: id, target: target, operation: operation)
+          constrained = constrained || !desktopFramesEqual(physical, target)
+        }
+        records[id]?.snapshot.availability = .available
+      }
+      camera.origin = CGPoint(x: origin, y: 0)
+      camera.page = Int(floor(origin / display.frame.width))
+      camera.focusTargetID = nil
+      if focusArrival {
+        let arrivals = ids.filter { records[$0]?.snapshot.managerMinimized == false }
+        camera.focusTargetID = pageFocus[camera.page].flatMap { arrivals.contains($0) ? $0 : nil } ?? arrivals.first
+      }
+      camera.detail = constrained ? "macOS constrained a partially visible window at the display edge." : nil
+      publish()
+      return camera
+    } catch {
+      refreshPendingRecovery()
+      camera.paused = true
+      camera.detail = "Camera paused: \(error.localizedDescription) Use Restore to release managed windows."
+      publish()
+      throw error
+    }
+  }
+
   func moveCamera(by delta: Int, display: DesktopCameraDisplay?, operation: DesktopOperation) throws -> DesktopCameraSnapshot {
     let display = try ensureCamera(display: display, operation: operation)
     guard !camera.paused else { throw DesktopWindowError.message("Resume the camera before switching pages.") }
@@ -1360,6 +1622,9 @@ extension DesktopWindowBackend {
   }
 
   private func applyCamera(page: Int, display: DesktopCameraDisplay, operation: DesktopOperation) throws -> DesktopCameraSnapshot {
+    if continuousCamera {
+      return try applyContinuousCamera(origin: display.origin(page: page).x, display: display, operation: operation, focusArrival: true)
+    }
     do {
       let ids = try cameraCandidates(operation: operation)
       if let currentFocusedID, let focused = records[currentFocusedID] {
@@ -1425,8 +1690,8 @@ extension DesktopWindowBackend {
     if paused {
       camera.paused = true
       var failures: [String] = []
-      for id in registrationOrder where records[id]?.snapshot.managerMinimized == true {
-        do { try setManagerMinimized(id: id, minimized: false, operation: operation) }
+      for id in registrationOrder where records[id]?.snapshot.managerMinimized == true || records[id]?.positionManaged == true {
+        do { try restoreManagedWindow(id: id, operation: operation) }
         catch { failures.append(error.localizedDescription) }
       }
       do { try reconcileCameraJournal(operation: operation) }
@@ -1445,6 +1710,7 @@ extension DesktopWindowBackend {
     }
     let display = try ensureCamera(display: display, operation: operation)
     camera.paused = false
+    if continuousCamera { return try applyContinuousCamera(origin: camera.origin.x, display: display, operation: operation) }
     return try applyCamera(page: camera.page, display: display, operation: operation)
   }
 
@@ -1459,7 +1725,7 @@ extension DesktopWindowBackend {
 
 extension DesktopWindowClient {
   private func runCamera(
-    focusArrival: Bool = false,
+    focusArrival: Bool = false, measurement: String? = nil,
     _ work: @escaping @Sendable (DesktopWindowBackend, DesktopCameraDisplay?, DesktopOperation) throws -> DesktopCameraSnapshot,
     completion: @escaping @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void
   ) {
@@ -1473,12 +1739,27 @@ extension DesktopWindowClient {
     let operation = DesktopOperation(timeout: 12)
     cameraOperation = operation
     let backend = backend
-    let display = DesktopCameraDisplay.current()
+    let display = displayProvider()
+    let dispatchStart = DispatchTime.now().uptimeNanoseconds
     backend.queue.async { [weak self] in
+      let workerStart = DispatchTime.now().uptimeNanoseconds
       let result = Result { try work(backend, display, operation) }
         .mapError { ($0 as? DesktopWindowError) ?? .message($0.localizedDescription) }
+      let workerMS = Double(DispatchTime.now().uptimeNanoseconds - workerStart) / 1_000_000
       DispatchQueue.main.async { [weak self] in
         guard let self, self.cameraOperation === operation else { return }
+        if let measurement, self.panMetrics != nil {
+          if case .success = result {
+            let deliveryMS = Double(DispatchTime.now().uptimeNanoseconds - dispatchStart) / 1_000_000
+            if measurement == "pan" {
+              self.panMetrics?.continuousWorker.append(workerMS)
+              self.panMetrics?.continuousDelivery.append(deliveryMS)
+            } else {
+              self.panMetrics?.discreteWorker.append(workerMS)
+              self.panMetrics?.discreteDelivery.append(deliveryMS)
+            }
+          } else { self.panMetrics?.failedBatches += 1 }
+        }
         if focusArrival, case .success(let snapshot) = result, let target = snapshot.focusTargetID {
           self.focus(id: target, cameraOwned: true) { [weak self] focusResult in
             guard let self else { return }
@@ -1504,15 +1785,57 @@ extension DesktopWindowClient {
     if let quit = queuedQuit {
       queuedQuit = nil
       queuedCameraMove = nil
+      cancelQueuedPan()
       restoreForQuit(completion: quit)
+    } else if let pause = queuedPause {
+      queuedPause = nil
+      cancelQueuedPan()
+      setCameraPaused(true, completion: pause)
     } else if let move = queuedCameraMove {
       queuedCameraMove = nil
       moveCamera(by: move.delta, completion: move.completion)
+    } else if let pan = queuedPan {
+      queuedPan = nil
+      panCamera(by: pan.delta, ended: pan.ended, completion: pan.completion)
     }
   }
 
-  func moveCamera(by delta: Int, completion: @escaping @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void) {
+  private func cancelQueuedPan() {
+    let pan = queuedPan
+    queuedPan = nil
+    pan?.completion(.failure(.message("Panning was cancelled for a camera command.")))
+  }
+
+  func panCamera(
+    by delta: CGFloat, ended: Bool = false,
+    completion: @escaping @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void
+  ) {
+    guard delta.isFinite else { completion(.failure(.message("Camera input must be finite."))); return }
+    guard queuedQuit == nil, queuedPause == nil, queuedCameraMove == nil else {
+      completion(.failure(.message("Panning is waiting for the pending camera command.")))
+      return
+    }
     if isCameraBusy {
+      panMetrics?.coalescedPackets += 1
+      let previous = queuedPan
+      let combined = (previous?.delta ?? 0) + delta
+      guard combined.isFinite else { completion(.failure(.message("Camera input overflowed."))); return }
+      queuedPan = (combined, ended || previous?.ended == true, completion)
+      previous?.completion(.failure(.cameraInputCoalesced))
+      return
+    }
+    runCamera(measurement: delta == 0 ? nil : "pan", { backend, display, operation in
+      try backend.panCamera(by: delta, ended: ended, display: display, operation: operation)
+    }, completion: completion)
+  }
+
+  func moveCamera(by delta: Int, completion: @escaping @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void) {
+    guard queuedQuit == nil, queuedPause == nil else {
+      completion(.failure(.message("Window restoration is already pending.")))
+      return
+    }
+    if isCameraBusy {
+      cancelQueuedPan()
       let previous = queuedCameraMove
       let (combined, overflow) = (previous?.delta ?? 0).addingReportingOverflow(delta)
       guard !overflow else { completion(.failure(.message("The requested camera step is too large."))); return }
@@ -1520,18 +1843,32 @@ extension DesktopWindowClient {
       previous?.completion(.failure(.message("A newer camera target replaced this queued request.")))
       return
     }
-    runCamera(focusArrival: true, { backend, display, operation in
+    runCamera(focusArrival: true, measurement: "page", { backend, display, operation in
       try backend.moveCamera(by: delta, display: display, operation: operation)
     }, completion: completion)
   }
 
   func moveFocusedToNewPage(completion: @escaping @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void) {
-    runCamera(focusArrival: true, { backend, display, operation in
+    runCamera(focusArrival: true, measurement: "page", { backend, display, operation in
       try backend.moveFocusedToNewPage(display: display, operation: operation)
     }, completion: completion)
   }
 
   func setCameraPaused(_ paused: Bool, completion: @escaping @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void) {
+    guard queuedQuit == nil else {
+      completion(.failure(.message("Quit restoration is already pending.")))
+      return
+    }
+    if paused, isCameraBusy {
+      cancelQueuedPan()
+      let move = queuedCameraMove
+      queuedCameraMove = nil
+      move?.completion(.failure(.message("Camera navigation was cancelled for restoration.")))
+      let previous = queuedPause
+      queuedPause = completion
+      previous?(.failure(.message("A newer restoration request replaced this request.")))
+      return
+    }
     runCamera({ backend, display, operation in
       try backend.setCameraPaused(paused, display: display, operation: operation)
     }, completion: completion)
@@ -1539,7 +1876,13 @@ extension DesktopWindowClient {
 
   func restoreForQuit(completion: @escaping @MainActor @Sendable (Result<DesktopCameraSnapshot, DesktopWindowError>) -> Void) {
     if isCameraBusy {
+      cancelQueuedPan()
+      let pause = queuedPause
+      queuedPause = nil
+      pause?(.failure(.message("Pause was replaced by quit restoration.")))
+      let previous = queuedQuit
       queuedQuit = completion
+      previous?(.failure(.message("A newer quit restoration replaced this request.")))
       if let move = queuedCameraMove {
         queuedCameraMove = nil
         move.completion(.failure(.message("Camera navigation was cancelled for window restoration.")))
@@ -1558,7 +1901,7 @@ extension DesktopWindowBackend {
   func acknowledgeManualRecovery() throws -> DesktopCameraSnapshot {
     loadCameraRecovery()
     guard let journal = cameraJournal else { throw DesktopWindowError.message("The recovery journal could not be opened.") }
-    let owned = Set(records.values.filter { $0.snapshot.managerMinimized }.map { $0.snapshot.id })
+    let owned = Set(records.values.filter { $0.snapshot.managerMinimized || $0.positionManaged }.map { $0.snapshot.id })
     for entry in journal.entries where !owned.contains(entry.id) { try journal.complete(id: entry.id) }
     camera.recoveryCount = 0
     camera.recoveryInstructions = nil

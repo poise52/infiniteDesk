@@ -24,11 +24,16 @@ func entry(id: UUID = UUID(), frame: CGRect = original) -> DesktopCameraJournalE
     bootSessionID: boot)
 }
 
-if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--interrupt" {
+if CommandLine.arguments.count == 3, ["--interrupt", "--interrupt-position"].contains(CommandLine.arguments[1]) {
   let journal = try DesktopCameraJournal(fileURL: URL(fileURLWithPath: CommandLine.arguments[2]))
   let saved = entry()
-  try journal.prepare(saved)
-  try journal.recordIntent(id: saved.id, frame: intended, minimized: true)
+  if CommandLine.arguments[1] == "--interrupt-position" {
+    try journal.preparePosition(saved)
+    try journal.checkpointRestorable(id: saved.id, frame: original.offsetBy(dx: 47, dy: 28), minimized: false)
+  } else {
+    try journal.prepare(saved)
+    try journal.recordIntent(id: saved.id, frame: intended, minimized: true)
+  }
   _exit(91)
 }
 
@@ -115,11 +120,90 @@ let encoded = try JSONEncoder().encode(a)
 let object = try JSONSerialization.jsonObject(with: encoded)
 for (name, document) in [
   ("duplicates", ["version": 1, "entries": [object, object]] as [String: Any]),
-  ("version", ["version": 2, "entries": [object]] as [String: Any]),
+  ("version", ["version": 3, "entries": [object]] as [String: Any]),
 ] {
   let url = temporary.appendingPathComponent("\(name).json")
   try JSONSerialization.data(withJSONObject: document).write(to: url)
   fails(name) { _ = try DesktopCameraJournal(fileURL: url) }
+}
+
+var legacyEntry = a
+legacyEntry.lastIntendedFrame = intended
+legacyEntry.lastIntendedMinimized = true
+var legacyObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(legacyEntry)) as! [String: Any]
+legacyObject.removeValue(forKey: "positionManaged")
+legacyObject.removeValue(forKey: "restorationFrame")
+legacyObject.removeValue(forKey: "restorationMinimized")
+let legacyFile = temporary.appendingPathComponent("legacy.json")
+try JSONSerialization.data(withJSONObject: ["version": 1, "entries": [legacyObject]]).write(to: legacyFile)
+do {
+  let journal = try DesktopCameraJournal(fileURL: legacyFile)
+  require(journal.entries == [legacyEntry], "V1 entries default to their original restore target without changing ownership")
+  try journal.preparePosition(entry(id: a.id, frame: intended))
+  require(journal.entries[0].positionManaged && journal.entries[0].originalFrame == original,
+          "Upgrading a parked entry must preserve the pre-mutation original")
+  require(journal.entries[0].restorationFrame == original,
+          "A camera projection cannot replace the V1 user restoration target")
+  require(journal.entries[0].lastIntendedFrame == intended && journal.entries[0].lastIntendedMinimized,
+          "Adding position ownership preserves the pending V1 minimization intent")
+  let persisted = try JSONSerialization.jsonObject(with: Data(contentsOf: legacyFile)) as! [String: Any]
+  require(persisted["version"] as? Int == 2, "The next durable change upgrades the document to V2")
+}
+
+let positionFile = temporary.appendingPathComponent("position.json")
+let manualFrame = original.offsetBy(dx: 47, dy: 28)
+do {
+  let journal = try DesktopCameraJournal(fileURL: positionFile)
+  try journal.preparePosition(a)
+  require(journal.durableCommitCount == 1, "The original must be durable before the first position mutation")
+  let initialEvidence = try Data(contentsOf: positionFile)
+  for _ in 0..<10_000 { try journal.preparePosition(entry(id: a.id, frame: intended)) }
+  require(journal.durableCommitCount == 1, "Repeated camera position ownership must perform zero extra commits")
+  fails("Position ownership cannot transfer to a reused PID") {
+    try journal.preparePosition(DesktopCameraJournalEntry(
+      id: a.id, pid: a.pid,
+      processIdentity: DesktopProcessIdentity(seconds: birth.seconds + 1, microseconds: 0),
+      title: a.title, appName: a.appName, bundleIdentifier: a.bundleIdentifier,
+      originalFrame: original, bootSessionID: boot))
+  }
+  let unchangedEvidence = try Data(contentsOf: positionFile)
+  require(unchangedEvidence == initialEvidence, "Camera tick projections must leave the saved user layout unchanged")
+  try journal.checkpointRestorable(id: a.id, frame: manualFrame, minimized: false)
+  require(journal.entries[0].originalFrame == original && journal.entries[0].restorationFrame == manualFrame,
+          "An accepted user drag changes the restore target while retaining the initial original")
+  for _ in 0..<100 { try journal.checkpointRestorable(id: a.id, frame: manualFrame, minimized: false) }
+  require(journal.durableCommitCount == 2, "Duplicate external geometry notifications cannot amplify durable writes")
+  fails("A restorable checkpoint requires position ownership") {
+    try journal.checkpointRestorable(id: UUID(), frame: manualFrame, minimized: false)
+  }
+  fails("Invalid user geometry cannot replace the last usable checkpoint") {
+    try journal.checkpointRestorable(id: a.id, frame: CGRect(x: 0, y: 0, width: 0, height: 10), minimized: false)
+  }
+  require(journal.entries[0].restorationFrame == manualFrame, "Rejected checkpoint keeps the prior usable target")
+}
+do {
+  let journal = try DesktopCameraJournal(fileURL: positionFile)
+  require(journal.entries[0].positionManaged && journal.entries[0].restorationFrame == manualFrame,
+          "A still-visible managed original must retain durable ownership and the user restore target")
+  let item = DesktopCameraRecovery.inspect(journal.entries, bootSessionID: boot) { _ in birth }[0]
+  require(item.instructions.contains("Restore to:") && item.instructions.contains("visible at different bounds"),
+          "Manual recovery must explain visible moved windows and give a restorable geometry")
+  try journal.complete(id: a.id)
+}
+
+let interruptedPositionFile = temporary.appendingPathComponent("interrupted-position/recovery.json")
+let positionChild = Process()
+positionChild.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+positionChild.arguments = ["--interrupt-position", interruptedPositionFile.path]
+try positionChild.run()
+positionChild.waitUntilExit()
+require(positionChild.terminationStatus == 91, "Position crash fixture must exit without teardown")
+do {
+  let journal = try DesktopCameraJournal(fileURL: interruptedPositionFile)
+  require(journal.entries.count == 1 && journal.entries[0].positionManaged && !journal.entries[0].lastIntendedMinimized,
+          "A crash after visible window movement must retain recovery independently of minimization")
+  require(journal.entries[0].originalFrame == original && journal.entries[0].restorationFrame == manualFrame,
+          "Interrupted camera ownership retains both initial and latest accepted user geometry")
 }
 
 let invalidGeometry = entry(frame: CGRect(x: 0, y: 0, width: -1, height: 1))
@@ -152,4 +236,4 @@ do {
   require(journal.entries == [a], "Prior durable original survives failed persistence")
 }
 
-print("Desktop recovery tests passed: durable pre-mutation intent, interrupted writer, exact-entry completion, identical titles, PID reuse, reboot, corrupt/duplicate/schema rejection, exclusive writer, immutable originals, safe failure, manual recovery only; zero AX writes.")
+print("Desktop recovery tests passed: V1 upgrade, V2 visible-position ownership, 10,000 ticks / one durable prepare, user restoration checkpoint, interrupted parked/visible writers, exact-entry completion, identical titles, PID reuse, reboot, corrupt/duplicate/schema rejection, exclusive writer, immutable originals, safe failure, manual recovery only; zero AX writes.")

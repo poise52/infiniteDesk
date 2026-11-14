@@ -288,3 +288,21 @@ disposable Chrome window through its own browser and verifies both frames.
 The recovery record remains available for manual acknowledgement. The test
 uses a private journal for each mode. Its report records the individual checks
 and the state observed independently of the manager.
+
+## Continuous horizontal pan
+
+Using the same fresh-manager procedure, set `INFINITEDESK_TEST_CAMERA_MODE=pan`.
+The driver sends ⌥⌘ drags, reverses direction, and samples the
+original Chrome window's horizontal position from WindowServer while it moves.
+The test compares the two native window frames with the manager's logical
+coordinates after each gesture, including partial visibility, parking and
+restoration. It types in the original, drags its title bar, verifies ordinary
+scrolling from the browser’s trusted DOM input and scroll position, pauses the manager,
+checks both restored frames and verifies that the recovery journal is empty.
+
+`camera.metrics` records successful native work and delivery times in
+milliseconds. `camera.motion.observedCGIntervals` describes the intervals
+between changed positions observed by a polling client. Display presentation
+times require a separate measurement. For a discrete comparison on the same
+build, start a fresh manager in `quit` mode and set
+`INFINITEDESK_TEST_PAGE_ROUNDTRIPS=4` to add eight verified page switches.

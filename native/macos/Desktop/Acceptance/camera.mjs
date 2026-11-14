@@ -6,6 +6,10 @@ import { verifyCameraLifecycle } from './camera-lifecycle.mjs';
 export async function verifyCamera(context) {
   const { mode, originals, pid, readBounds, readModel, journalPath, session, snapshot, native,
     fixtureShortcut, typeToken, eventually, report, saveReport } = context;
+  const pageRoundTrips = Number(process.env.INFINITEDESK_TEST_PAGE_ROUNDTRIPS ?? '0');
+  assert(Number.isInteger(pageRoundTrips) && pageRoundTrips >= 0 && pageRoundTrips <= 10,
+    'INFINITEDESK_TEST_PAGE_ROUNDTRIPS must be an integer from 0 to 10');
+  assert(mode === 'quit' || pageRoundTrips === 0, 'Additional page round trips require quit mode');
   const initial = await readModel();
   assert.equal(initial.testSession, session);
   assert.equal(initial.camera.page, 0);
@@ -21,6 +25,7 @@ export async function verifyCamera(context) {
   report.camera.displayWidth = width;
   report.camera.finder = finder;
   report.camera.binding = binding;
+  report.camera.pageRoundTrips = pageRoundTrips;
   const receipt = native('manager-identity', initial.managerPID, session, context.statePath, journalPath);
   assert.equal(receipt.pid, initial.managerPID);
 
@@ -71,6 +76,7 @@ export async function verifyCamera(context) {
       }
     }, observed => observed.ok, 8500);
     report.camera.checkpoints.push({ label, ...result });
+    report.camera.metrics = result.state.pan;
     console.log('PASS: ' + label);
     await saveReport();
   }
@@ -92,6 +98,12 @@ export async function verifyCamera(context) {
   assert(await typeToken('Type directly in A on page 0', 'A', originals.A.id, '-page-A'));
   await fixtureShortcut(originals.A.id, 'pageRight');
   await check('Return to B at its manually moved position', 1, false, 'B');
+  for (let round = 1; round <= pageRoundTrips; round++) {
+    await fixtureShortcut(originals.B.id, 'pageLeft');
+    await check(`Comparative page round trip ${round}/${pageRoundTrips}: original A`, 0, false, 'A');
+    await fixtureShortcut(originals.A.id, 'pageRight');
+    await check(`Comparative page round trip ${round}/${pageRoundTrips}: original B`, 1, false, 'B');
+  }
   await fixtureShortcut(originals.B.id, 'togglePause');
   await check('Pause releases both originals', 1, true);
   const paused = snapshot();

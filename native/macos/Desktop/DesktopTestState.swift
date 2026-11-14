@@ -69,12 +69,14 @@ final class DesktopTestState: @unchecked Sendable {
     let windows: [Window]
     let focusedID: UUID?
     let camera: Camera
+    let pan: DesktopPanMetrics?
   }
 
   private struct Snapshot: Sendable {
     let windows: [DesktopWindow]
     let focusedID: UUID?
     let camera: Camera
+    let pan: DesktopPanMetrics?
   }
 
   private static let logger = Logger(subsystem: "dev.infinitedesk.desktop", category: "test-state")
@@ -103,9 +105,10 @@ final class DesktopTestState: @unchecked Sendable {
   }
 
   func publish(
-    windows: [DesktopWindow], focusedID: UUID?, camera: DesktopCameraSnapshot, busy: Bool
+    windows: [DesktopWindow], focusedID: UUID?, camera: DesktopCameraSnapshot, busy: Bool,
+    pan: DesktopPanMetrics? = nil
   ) {
-    let snapshot = Snapshot(windows: windows, focusedID: focusedID, camera: Camera(camera, busy: busy))
+    let snapshot = Snapshot(windows: windows, focusedID: focusedID, camera: Camera(camera, busy: busy), pan: pan)
     lock.lock()
     guard !stopped else { lock.unlock(); return }
     pending = snapshot
@@ -139,7 +142,8 @@ final class DesktopTestState: @unchecked Sendable {
           at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let output = Output(
           managerPID: ProcessInfo.processInfo.processIdentifier, testSession: testSession,
-          windows: snapshot.windows.map(Window.init), focusedID: snapshot.focusedID, camera: snapshot.camera)
+          windows: snapshot.windows.map(Window.init), focusedID: snapshot.focusedID, camera: snapshot.camera,
+          pan: snapshot.pan)
         try encoder.encode(output).write(to: fileURL, options: .atomic)
       } catch {
         let failure = error as NSError

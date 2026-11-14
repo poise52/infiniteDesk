@@ -56,15 +56,21 @@ func frameJSON(_ frame: CGRect) -> [String: Double] {
   ["x": frame.minX, "y": frame.minY, "width": frame.width, "height": frame.height]
 }
 
-func visibleIDs(_ pid: pid_t) throws -> Set<CGWindowID> {
+func visibleFrames(_ pid: pid_t) throws -> [CGWindowID: CGRect] {
   guard let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
     throw Failure.message("Cannot read visible windows")
   }
-  return Set(list.compactMap {
-    guard ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
-      ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0 else { return nil }
-    return ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value
-  })
+  var frames: [CGWindowID: CGRect] = [:]
+  for entry in list {
+    guard (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
+      (entry[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+      let number = entry[kCGWindowNumber as String] as? NSNumber,
+      let bounds = entry[kCGWindowBounds as String] as? NSDictionary,
+      let frame = CGRect(dictionaryRepresentation: bounds)
+    else { continue }
+    frames[number.uint32Value] = frame
+  }
+  return frames
 }
 
 struct Window {
@@ -364,10 +370,11 @@ func launchContext() -> [String: Any] {
   _ = AXUIElementSetMessagingTimeout(app, 0.3)
   var current = try windows(pid, app: app)
   if command == "snapshot" {
-    let visible = try visibleIDs(pid)
+    let visible = try visibleFrames(pid)
     try output(["pid": pid, "frontmostPID": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,
                 "focusedID": focusedID(app, windows: current).map { Int($0) } ?? NSNull(),
-                "onscreenIDs": visible.sorted(), "displayWidth": CGDisplayBounds(CGMainDisplayID()).width,
+                "onscreenIDs": visible.keys.sorted(), "displayWidth": CGDisplayBounds(CGMainDisplayID()).width,
+                "onscreenFrames": Dictionary(uniqueKeysWithValues: visible.map { (String($0.key), frameJSON($0.value)) }),
                 "windows": current.map { ["id": $0.id, "title": $0.title, "frame": frameJSON($0.frame),
                   "minimized": attribute($0.element, kAXMinimizedAttribute) ?? NSNull()] as [String: Any] }])
     return
@@ -375,6 +382,11 @@ func launchContext() -> [String: Any] {
   guard args.count >= 3, let id = CGWindowID(args[2]),
     let target = current.first(where: { $0.id == id })
   else { throw Failure.message("Expected a uniquely identified disposable window") }
+  if command == "pan-input" {
+    guard args.count == 4 else { throw Failure.message("Expected fixture pan input") }
+    try output(postFixturePan(args[3], target: target, pid: pid, app: app))
+    return
+  }
   if command == "gesture" {
     guard args.count == 4 else { throw Failure.message("Expected gesture payload") }
     try output(try mouseGesture(target, pid: pid, app: app, payload: args[3]))

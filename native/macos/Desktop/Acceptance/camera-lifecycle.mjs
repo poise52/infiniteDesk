@@ -96,7 +96,7 @@ export async function verifyCameraLifecycle({
     try { content = await readFile(journalPath, 'utf8'); }
     catch (error) { if (error.code === 'ENOENT') return { version: 1, entries: [] }; throw error; }
     const value = JSON.parse(content);
-    assert.equal(value.version, 1);
+    assert([1, 2].includes(value.version), 'Unsupported recovery journal version');
     assert(Array.isArray(value.entries), 'Recovery journal has no entries array');
     assert(value.entries.every(entry => entry.pid === pid), 'Refusing lifecycle with unrelated recovery entries');
     return value;

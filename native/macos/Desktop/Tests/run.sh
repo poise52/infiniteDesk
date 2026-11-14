@@ -13,4 +13,5 @@ xcrun swiftc -swift-version 6 -warnings-as-errors -target "$arch-apple-macosx15.
   "$root/native/macos/Desktop/Tests/main.swift" -o "$build/desktop-window-tests"
 "$build/desktop-window-tests"
 "$root/native/macos/Desktop/Tests/Camera/run.sh"
+"$root/native/macos/Desktop/Tests/PanInput/run.sh"
 exec "$root/native/macos/Desktop/Tests/Recovery/run.sh"

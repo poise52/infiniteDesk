@@ -3,7 +3,7 @@
 > [!WARNING]
 > **Do not download or install InfiniteDesk.** The project is unfinished. The build instructions below are for development and testing only.
 
-InfiniteDesk is a macOS menu bar app for registering and focusing real application windows. Registration reads the focused window where it is. You can then switch between registered windows, including two windows belonging to the same app. The development build also has discrete workspace pages at 1:1 scale, Pause/Restore and an interrupted-session recovery journal. Registrations last for the current session. Continuous panning and the zoomed-out overview are planned.
+InfiniteDesk is a macOS menu bar app for registering and focusing real application windows. Registration reads the focused window where it is. You can then switch between registered windows, including two windows belonging to the same app. The development build also has horizontal workspace panning and page shortcuts at 1:1 scale, Pause/Restore and an interrupted-session recovery journal. Registrations last for the current session. The zoomed-out overview is planned.
 
 ## Build and try the desktop manager
 
@@ -29,13 +29,21 @@ For the experimental page controls, use one display and one ordinary macOS Space
 | **⌃⌥⌘← / →** | Focus the previous/next registered window; reveal its page when necessary. |
 | **⌃⌥⌘N** | Move the focused registered window one page right and follow it. |
 | **⌃⌥⌘[ / ]** | Move the camera to the previous/next workspace page. |
+| **⌥⌘ + left drag** | Pan horizontally; the workspace follows the pointer. Release, reposition the pointer and drag again to continue. |
+| **⌃⌥⌘ + scroll** | Pan with a mouse wheel or trackpad; horizontal scrolling takes precedence, vertical scrolling is a fallback. |
 | **⌃⌥⌘P** | Pause and restore managed windows; press again to resume the workspace. |
 
-These commands are also available from the menu. If macOS cannot register a shortcut, the menu identifies the failed combination; resolve the conflict and choose **Retry global shortcuts**. Bracket shortcuts use the physical US bracket keys.
+The keyboard commands are also available from the menu. If macOS cannot register a shortcut or install the pan event tap, the menu reports the failure; resolve the conflict and choose **Retry global input**. Bracket shortcuts use the physical US bracket keys.
 
-**Pause and restore windows** makes managed windows accessible again and suspends workspace placement. If restoration fails, **⌃⌥⌘P** retries **Restore parked windows** before allowing Resume. **Restore windows and quit InfiniteDesk** restores them before exiting; a failed restore keeps the manager running and reports the failure. Force Quit cannot run this restore. After an interrupted session, choose **Recover interrupted session…**, restore the listed windows through their application's Window menu or Dock icon, then explicitly acknowledge that you restored them. Recovery does not guess window identity from a title or PID.
+To try continuous pan, register two windows, hold **⌥⌘ before pressing the left mouse button**, then drag horizontally. This gesture works over an application's content or title bar and does not click or drag the underlying window. Drag right to bring workspace content right; drag left to explore further right. Release the button to finish, then type or scroll in the original app normally. Adding the chord after a normal mouse-down preserves the application's drag. Releasing the chord during pan stops movement and consumes the rest of that button gesture. **⌃⌥⌘ + scroll** follows the macOS scrolling direction; the manager multiplies each delivered wheel unit by 24 points and uses trackpad point deltas directly. Mouse utilities can change the units macOS delivers. Keep the chord held for trackpad momentum; releasing it stops pan and absorbs the remaining momentum of that gesture.
 
-On macOS 27.0.1, the local GUI tests verified page switching and immediate typing in two Chrome 156 windows with identical titles on one display. The off-page original disappeared from the on-screen window list, and the visible Finder window kept its bounds. Both Pause and normal Quit released the parked original. After a forced termination, the restarted manager kept the journal available for manual recovery. Continuous panning, zoom and multi-display behavior remain outside this test.
+Pan requires Accessibility, a running workspace and at least one registered window. It leaves typing in the selected app when panning across visible windows. Screen Recording and Input Monitoring permissions are not required by the manager. Ordinary clicks and unmodified scrolling remain with the active application. The public session event tap filters only these dedicated gestures. The manager checks Accessibility at gesture start and when the menu opens. Granting access again and choosing **Retry global input** reinstalls it. No input polling or idle animation timer runs. A timeout cancels the current pan and asks you to release and restart the gesture; the menu also reports a tap disabled by the system.
+
+**Pause and restore windows** makes managed windows accessible again and suspends workspace placement. If restoration fails, **⌃⌥⌘P** retries **Restore managed windows** before allowing Resume. **Restore windows and quit InfiniteDesk** restores them before exiting; a failed restore keeps the manager running and reports the failure. Force Quit cannot run this restore. After an interrupted session, choose **Recover interrupted session…**, restore the listed windows through their application's Window menu or Dock icon, then explicitly acknowledge that you restored them. Recovery does not guess window identity from a title or PID.
+
+On macOS 27.0.1, the earlier local GUI tests verified page switching and immediate typing in two Chrome 156 windows with identical titles on one display. The off-page original disappeared from the on-screen window list, and the visible Finder window kept its bounds. Both Pause and normal Quit released the parked original. After a forced termination, the restarted manager kept the journal available for manual recovery. A separate live pan test moved both original windows, reversed direction, moved A to x = −32 pt, then parked and restored it. B kept keyboard focus when A returned, and the next typed token reached B’s original text field. Ordinary wheel input scrolled the browser. Pause restored A and kept B’s most recent manual placement.
+
+On this Mac, 230 continuous camera batches over two Chrome windows took 19.3 ms at p50, 38.0 ms at p95 and 40.0 ms at p99 on the AX worker. Independent WindowServer polling observed changing positions at p99 intervals of 41–42 ms across two drags. Display presentation and native-window counts above two still need measurement.
 
 Run the desktop checks without opening windows or granting Accessibility access:
 
@@ -48,6 +56,8 @@ CI builds the desktop bundle and runs both checks. For the opt-in live test,
 follow the [desktop acceptance instructions](native/macos/Desktop/Acceptance/README.md)
 and run `native/macos/Desktop/Acceptance/run.sh --run` in a graphical session
 with the documented permissions. Headless checks do not verify live window focus.
+
+For opt-in pan measurements, launch the manager with an absolute `INFINITEDESK_TEST_STATE_PATH` (the acceptance harness configures this). Its atomic JSON snapshot includes `pan.continuousWorker`, `continuousDelivery`, `discreteWorker` and `discreteDelivery`, each with total successful batch count, the latest 512 samples in milliseconds and p50/p95/p99. Continuous samples describe applied nonzero AX batches, including accepted-frame readback and journal durability; delivery additionally includes queue wait and main-thread result delivery. Discrete page navigation is recorded separately and excludes subsequent arrival-focus work. `coalescedPackets` counts input packets merged while the camera worker is occupied; `failedBatches` counts failed measured batches. These numbers measure application processing, not physical display output, input-to-photon latency or a verified frame rate. Samples are retained in memory; the existing background snapshot writer coalesces exports and computes percentiles only while encoding. Metrics are disabled in ordinary launches; `INFINITEDESK_PAN_METRICS=1` enables in-memory collection without a file export.
 
 ## Board prototype and benchmarks
 

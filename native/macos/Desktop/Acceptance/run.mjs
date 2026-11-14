@@ -19,7 +19,7 @@ const cameraMode = process.env.INFINITEDESK_TEST_CAMERA_MODE;
 const journalPath = process.env.INFINITEDESK_TEST_CAMERA_JOURNAL_PATH;
 const session = process.env.INFINITEDESK_TEST_SESSION;
 if (cameraMode) {
-  assert(['quit', 'crash'].includes(cameraMode) && statePath && isAbsolute(journalPath ?? '')
+  assert(['quit', 'crash', 'pan'].includes(cameraMode) && statePath && isAbsolute(journalPath ?? '')
     && /^[a-f0-9-]{32,36}$/i.test(session ?? ''), 'Camera acceptance needs an isolated test manager, journal, and session UUID');
 }
 const geometryCases = ['Original model geometry', 'External titlebar click focuses B', 'Fast titlebar drag B',
@@ -626,6 +626,7 @@ try {
   report.originals = { A: a, B: b };
   let setupInputPassed = true;
   for (const [name, window] of [['A', a], ['B', b]]) {
+    if (cameraMode) await cdp.send('Target.activateTarget', { targetId: targets[name].targetId });
     native('focus', pid, window.id);
     await evaluate(targets[name], `(() => { const field = document.querySelector('#target'); field.focus();
       field.setSelectionRange(field.value.length, field.value.length); })()`);
@@ -645,7 +646,7 @@ try {
   unchanged(requireNative(report.setupEvidence), baseline);
   await saveReport();
   if (cameraMode) {
-    const { verifyCamera } = await import('./camera.mjs');
+    const verifyWorkspace = cameraMode === 'pan' ? (await import('./pan.mjs')).verifyPan : (await import('./camera.mjs')).verifyCamera;
     const readBounds = async name => (await cdp.send('Browser.getWindowBounds', { windowId: targets[name].windowId })).bounds;
     const restoreFixture = async name => {
       assert(['A', 'B'].includes(name));
@@ -654,8 +655,9 @@ try {
     for (const target of [targets.A, targets.B]) await evaluate(target, 'document.title = "InfiniteDesk Identical Title"');
     await eventually('Fixture windows need matching AX titles', async () => snapshot(), state =>
       state.windows.length === 2 && state.windows.every(window => window.title.startsWith('InfiniteDesk Identical Title')));
-    await verifyCamera({ mode: cameraMode, originals: { A: a, B: b }, pid, journalPath, statePath, session,
-      readModel, readBounds, restoreFixture, snapshot, native, fixtureShortcut, typeToken, eventually, report, saveReport });
+    await verifyWorkspace({ mode: cameraMode, originals: { A: a, B: b }, pid, journalPath, statePath, session,
+      readModel, readBounds, restoreFixture, snapshot, native, fixtureShortcut, typeToken, eventually, report, saveReport,
+      evaluateFixture: (name, expression) => evaluate(targets[name], expression) });
     assert(setupInputPassed, 'Native typing failed during registration');
     report.inputStatus = 'PASS';
     report.camera.status = 'PASS';

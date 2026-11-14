@@ -12,7 +12,7 @@ struct DesktopCameraRecoveryItem: Sendable, Identifiable {
   var explanation: String {
     switch process {
     case .sameInstance:
-      return "The application is still running. Unminimize and restore the intended window manually; saved title and bounds cannot identify it safely after a crash."
+      return "The application is still running. Unminimize if needed and restore the saved window manually; saved title and bounds cannot identify it safely after a crash."
     case .exited:
       return "The original application process exited. A reopened window is a different window; restore your layout manually before acknowledging this entry."
     case .replaced:
@@ -27,9 +27,12 @@ struct DesktopCameraRecoveryItem: Sendable, Identifiable {
   var instructions: String {
     let original = entry.originalFrame
     let intended = entry.lastIntendedFrame
+    let restorable = entry.restorationFrame
     return "\(entry.appName) — \(entry.title)\nPID \(entry.pid), process start \(entry.processIdentity.seconds).\(entry.processIdentity.microseconds), bundle \(entry.bundleIdentifier ?? "unknown")\n"
       + "Original: x=\(original.origin.x), y=\(original.origin.y), width=\(original.width), height=\(original.height), minimized=\(entry.originalMinimized).\n"
+      + "Restore to: x=\(restorable.origin.x), y=\(restorable.origin.y), width=\(restorable.width), height=\(restorable.height), minimized=\(entry.restorationMinimized).\n"
       + "Last intended: x=\(intended.origin.x), y=\(intended.origin.y), width=\(intended.width), height=\(intended.height), minimized=\(entry.lastIntendedMinimized).\n"
+      + (entry.positionManaged ? "Camera movement may have left this window visible at different bounds. Restore to the saved target above, which includes your latest accepted manual move.\n" : "")
       + explanation
   }
 }

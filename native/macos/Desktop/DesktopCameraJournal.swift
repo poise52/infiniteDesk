@@ -13,6 +13,9 @@ struct DesktopCameraJournalEntry: Codable, Equatable, Sendable, Identifiable {
   let bootSessionID: String?
   var lastIntendedFrame: CGRect
   var lastIntendedMinimized: Bool
+  var positionManaged: Bool
+  var restorationFrame: CGRect
+  var restorationMinimized: Bool
 
   init(
     id: UUID, pid: pid_t, processIdentity: DesktopProcessIdentity, title: String,
@@ -30,6 +33,33 @@ struct DesktopCameraJournalEntry: Codable, Equatable, Sendable, Identifiable {
     self.bootSessionID = bootSessionID
     lastIntendedFrame = originalFrame
     lastIntendedMinimized = originalMinimized
+    positionManaged = false
+    restorationFrame = originalFrame
+    restorationMinimized = originalMinimized
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case id, pid, processIdentity, title, appName, bundleIdentifier, originalFrame, originalMinimized
+    case bootSessionID, lastIntendedFrame, lastIntendedMinimized
+    case positionManaged, restorationFrame, restorationMinimized
+  }
+
+  init(from decoder: any Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    id = try values.decode(UUID.self, forKey: .id)
+    pid = try values.decode(pid_t.self, forKey: .pid)
+    processIdentity = try values.decode(DesktopProcessIdentity.self, forKey: .processIdentity)
+    title = try values.decode(String.self, forKey: .title)
+    appName = try values.decode(String.self, forKey: .appName)
+    bundleIdentifier = try values.decodeIfPresent(String.self, forKey: .bundleIdentifier)
+    originalFrame = try values.decode(CGRect.self, forKey: .originalFrame)
+    originalMinimized = try values.decode(Bool.self, forKey: .originalMinimized)
+    bootSessionID = try values.decodeIfPresent(String.self, forKey: .bootSessionID)
+    lastIntendedFrame = try values.decode(CGRect.self, forKey: .lastIntendedFrame)
+    lastIntendedMinimized = try values.decode(Bool.self, forKey: .lastIntendedMinimized)
+    positionManaged = try values.decodeIfPresent(Bool.self, forKey: .positionManaged) ?? false
+    restorationFrame = try values.decodeIfPresent(CGRect.self, forKey: .restorationFrame) ?? originalFrame
+    restorationMinimized = try values.decodeIfPresent(Bool.self, forKey: .restorationMinimized) ?? originalMinimized
   }
 }
 
@@ -63,7 +93,7 @@ enum DesktopCameraJournalError: LocalizedError {
 // The backend's serial AX queue owns this store. No I/O is performed by rendering or main-actor code.
 final class DesktopCameraJournal {
   private struct Document: Codable {
-    var version = 1
+    var version = 2
     let entries: [DesktopCameraJournalEntry]
   }
 
@@ -71,6 +101,7 @@ final class DesktopCameraJournal {
   private let lockDescriptor: Int32
   private var failed = false
   private(set) var entries: [DesktopCameraJournalEntry]
+  private(set) var durableCommitCount = 0
   private static let maximumBytes = 16 * 1024 * 1024
 
   init(fileURL: URL? = nil) throws {
@@ -137,12 +168,51 @@ final class DesktopCameraJournal {
   }
 
   func recordIntent(id: UUID, frame: CGRect, minimized: Bool) throws {
+    guard !failed else { throw DesktopCameraJournalError.failed }
     guard let index = entries.firstIndex(where: { $0.id == id }) else {
       throw DesktopCameraJournalError.invalid("mutation has no saved original")
     }
     var candidate = entries
     candidate[index].lastIntendedFrame = frame
     candidate[index].lastIntendedMinimized = minimized
+    try Self.validate(candidate[index])
+    try commit(candidate)
+  }
+
+  // Ownership and a usable restore target reach disk before the first AXPosition write.
+  // Camera ticks only change live session state: a crash needs the restore target,
+  // not an exact final camera projection or a title/bounds guess at an AX handle.
+  func preparePosition(_ entry: DesktopCameraJournalEntry) throws {
+    guard !failed else { throw DesktopCameraJournalError.failed }
+    try Self.validate(entry)
+    if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+      let existing = entries[index]
+      guard existing.pid == entry.pid, existing.processIdentity == entry.processIdentity,
+        existing.bootSessionID == entry.bootSessionID
+      else { throw DesktopCameraJournalError.invalid("an existing process identity cannot be replaced") }
+      guard !existing.positionManaged else { return }
+      var candidate = entries
+      candidate[index].positionManaged = true
+      try commit(candidate)
+    } else {
+      guard entries.count < 4096 else { throw DesktopCameraJournalError.invalid("too many entries") }
+      var saved = entry
+      saved.positionManaged = true
+      try commit(entries + [saved])
+    }
+  }
+
+  // Only an accepted external drag/resize changes this checkpoint. Projections
+  // written by the camera must never be passed here or replace the user layout.
+  func checkpointRestorable(id: UUID, frame: CGRect, minimized: Bool) throws {
+    guard !failed else { throw DesktopCameraJournalError.failed }
+    guard let index = entries.firstIndex(where: { $0.id == id }), entries[index].positionManaged else {
+      throw DesktopCameraJournalError.invalid("position checkpoint has no saved original")
+    }
+    guard entries[index].restorationFrame != frame || entries[index].restorationMinimized != minimized else { return }
+    var candidate = entries
+    candidate[index].restorationFrame = frame
+    candidate[index].restorationMinimized = minimized
     try Self.validate(candidate[index])
     try commit(candidate)
   }
@@ -155,7 +225,7 @@ final class DesktopCameraJournal {
   }
 
   private static func validate(_ entry: DesktopCameraJournalEntry) throws {
-    let frames = [entry.originalFrame, entry.lastIntendedFrame]
+    let frames = [entry.originalFrame, entry.lastIntendedFrame, entry.restorationFrame]
     guard entry.pid > 0, entry.processIdentity.microseconds < 1_000_000,
       let boot = entry.bootSessionID, UUID(uuidString: boot) != nil,
       frames.allSatisfy({ frame in
@@ -188,7 +258,7 @@ final class DesktopCameraJournal {
       }
     }
     let document = try JSONDecoder().decode(Document.self, from: data)
-    guard document.version == 1, document.entries.count <= 4096,
+    guard (1...2).contains(document.version), document.entries.count <= 4096,
       Set(document.entries.map(\.id)).count == document.entries.count
     else { throw DesktopCameraJournalError.invalid("unknown schema or duplicate window IDs") }
     for entry in document.entries { try validate(entry) }
@@ -202,6 +272,7 @@ final class DesktopCameraJournal {
     do {
       try durableReplace(data)
       entries = candidate
+      durableCommitCount += 1
     } catch {
       // A rename may already have succeeded. Further writes could otherwise overwrite an
       // entry that reached disk but whose directory sync failed.
