@@ -5,7 +5,7 @@ func routeFocusShortcut(
   focus: () -> Void
 ) -> Bool {
   let relevant = modifiers.intersection([.command, .control, .option, .shift])
-  guard selected, (keyCode == 36 || keyCode == 76), relevant == [.command] else { return false }
+  guard selected, keyCode == 36 || keyCode == 76, relevant == [.command] else { return false }
   if !isRepeat { focus() }
   return true
 }

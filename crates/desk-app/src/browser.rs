@@ -111,7 +111,7 @@ impl Browser {
     pub fn set_selected(&self, selected: Option<WindowId>) {
         // SAFETY: the owned handle and parent window remain alive on the main thread.
         unsafe {
-            desk_browser_set_selected(self.handle.as_ptr(), u8::from(selected == Some(self.id)))
+            desk_browser_set_selected(self.handle.as_ptr(), u8::from(selected == Some(self.id)));
         };
     }
 
