@@ -249,6 +249,7 @@ final class Canvas: NSView {
   let context = CIContext(options: nil)
   let captureQueue = DispatchQueue(label: "stage6.capture")
   let axQueue = DispatchQueue(label: "stage6.ax")
+  var browserDelivery: BrowserDelivery = .ax
   var browser: Process?
   var browserTitle: String?
   var browserPressPending = false
@@ -330,10 +331,22 @@ final class Canvas: NSView {
       stack.addArrangedSubview(button)
     }
     root.addSubview(stack)
-    status.frame = NSRect(x: 10, y: 630, width: 1260, height: 120)
+    let browserStack = NSStackView()
+    browserStack.orientation = .horizontal
+    browserStack.spacing = 5
+    browserStack.frame = NSRect(x: 10, y: 718, width: 300, height: 30)
+    browserStack.autoresizingMask = [.minYMargin, .maxXMargin]
+    for (title, action) in [
+      ("Browser AX", #selector(toggleBrowserDelivery)),
+      ("Show browser", #selector(showBrowser)),
+    ] {
+      browserStack.addArrangedSubview(NSButton(title: title, target: self, action: action))
+    }
+    root.addSubview(browserStack)
+    status.frame = NSRect(x: 10, y: 590, width: 1260, height: 120)
     status.autoresizingMask = [.width, .minYMargin]
     root.addSubview(status)
-    canvas.frame = NSRect(x: 10, y: 10, width: 1260, height: 610)
+    canvas.frame = NSRect(x: 10, y: 10, width: 1260, height: 570)
     canvas.autoresizingMask = [.width, .height]
     root.addSubview(canvas)
     canvas.input = { [weak self] type, point in self?.sendMouse(type, point) }
@@ -791,11 +804,13 @@ final class Canvas: NSView {
       inputEnabled = false
       sender.title = "Input OFF"
     } else if browser != nil && stream != nil && canvas.image != nil && validTarget()
-      && AXIsProcessTrusted() && NSApp.isActive && window.isKeyWindow
+      && AXIsProcessTrusted() && (browserDelivery == .ax || CGPreflightPostEventAccess())
+      && NSApp.isActive && window.isKeyWindow
       && streamActivityFresh(last: lastStreamActivity, now: ProcessInfo.processInfo.systemUptime)
     {
       inputEnabled = true
-      focusDiagnostic = "Browser AXPress enabled: click Press me"
+      focusDiagnostic =
+        "Browser \(browserDelivery == .ax ? "AX" : "Pointer") enabled: click Press me"
       updateGeometryStatus()
     } else if stream != nil && canvas.image != nil && canvas.sourceRect.width > 0 && validFixture()
       && AXIsProcessTrusted() && CGPreflightPostEventAccess()

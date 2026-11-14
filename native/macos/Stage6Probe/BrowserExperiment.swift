@@ -2,9 +2,11 @@ import AppKit
 @preconcurrency import ApplicationServices
 import Foundation
 
+enum BrowserDelivery: Sendable { case ax, pointer }
+
 func browserPress(
   pid: pid_t, windowID: CGWindowID, title: String, frame: CGRect, point: CGPoint,
-  token: FocusCancellation
+  token: FocusCancellation, delivery: BrowserDelivery
 ) -> String {
   func currentWindowMatches() -> Bool {
     guard
@@ -101,17 +103,42 @@ func browserPress(
       else {
         return "AX button bounds or baseline changed"
       }
-      let result = AXUIElementPerformAction(candidate, kAXPressAction as CFString)
-      guard result == .success else { return "AXPress: \(result.rawValue)" }
+      let sent: String
+      switch delivery {
+      case .ax:
+        let result = AXUIElementPerformAction(candidate, kAXPressAction as CFString)
+        guard result == .success else { return "AXPress: \(result.rawValue)" }
+        sent = "AXPress accepted"
+      case .pointer:
+        guard CGPreflightPostEventAccess(),
+          let down = CGEvent(
+            mouseEventSource: nil, mouseType: .leftMouseDown,
+            mouseCursorPosition: point, mouseButton: .left),
+          let up = CGEvent(
+            mouseEventSource: nil, mouseType: .leftMouseUp,
+            mouseCursorPosition: point, mouseButton: .left),
+          !token.isCancelled(), currentWindowMatches(), !token.isCancelled()
+        else { return "Pointer blocked: permission, event creation or identity" }
+        for event in [down, up] {
+          event.setIntegerValueField(.mouseEventNumber, value: 1)
+          event.setIntegerValueField(.mouseEventClickState, value: 1)
+          event.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(windowID))
+          event.setIntegerValueField(
+            .mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(windowID))
+        }
+        down.postToPid(pid)
+        up.postToPid(pid)
+        sent = "Pointer down/up posted"
+      }
       let deadline = ProcessInfo.processInfo.systemUptime + 1.0
       repeat {
-        guard !token.isCancelled() else { return "AXPress accepted, acknowledgement cancelled" }
+        guard !token.isCancelled() else { return "\(sent), acknowledgement cancelled" }
         if let count = readCount(), count > baseline {
-          return "DOM acknowledged Pressed \(count) (baseline \(baseline))"
+          return "\(sent); DOM acknowledged Pressed \(count) (baseline \(baseline))"
         }
         Thread.sleep(forTimeInterval: 0.05)
       } while ProcessInfo.processInfo.systemUptime < deadline
-      return "AXPress accepted, no DOM acknowledgement (baseline \(baseline))"
+      return "\(sent), no DOM acknowledgement (baseline \(baseline))"
     }
     guard depth < 3,
       role == (kAXStaticTextRole as String) || (depth > 0 && role == (kAXGroupRole as String)),
@@ -128,6 +155,31 @@ func browserPress(
 }
 
 @MainActor extension ProbeDelegate {
+  @objc func toggleBrowserDelivery(_ sender: NSButton) {
+    releaseInput()
+    inputEnabled = false
+    browserDelivery = browserDelivery == .ax ? .pointer : .ax
+    sender.title = browserDelivery == .ax ? "Browser AX" : "Browser Pointer"
+    focusDiagnostic = "Browser mode: \(browserDelivery == .ax ? "AX" : "Pointer"); input OFF"
+    updateGeometryStatus()
+  }
+
+  @objc func showBrowser() {
+    guard let process = browser, validTarget(),
+      let app = NSRunningApplication(processIdentifier: process.processIdentifier)
+    else {
+      focusDiagnostic = "Browser source unavailable"
+      updateGeometryStatus()
+      return
+    }
+    releaseInput()
+    inputEnabled = false
+    if !app.activate() {
+      focusDiagnostic = "Browser activation was not accepted"
+      updateGeometryStatus()
+    }
+  }
+
   @objc func launchBrowser() {
     guard fixture?.isRunning != true, browser?.isRunning != true, !session.busy,
       !stopping, unknownStream == nil
@@ -153,14 +205,12 @@ func browserPress(
       try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: false)
       created = true
       let page = dir.appendingPathComponent("index.html")
-      let html = """
-        <!doctype html><html><head><meta charset="utf-8"><title>\(title)</title></head>
-        <body data-count="0" style="font: 24px system-ui; padding: 32px">
-        <h1>InfiniteDesk browser test</h1><p>\(title)</p>
-        <button style="font: inherit; padding: 16px" onclick="const n = Number(document.body.dataset.count) + 1; document.body.dataset.count = String(n); document.getElementById('result').textContent = 'Pressed ' + n; document.title = '\(title) · Pressed ' + n">Press me</button>
-        <p id="result">Not pressed</p><label>Test field <input style="font: inherit"></label>
-        </body></html>
-        """
+      guard let templateURL = Bundle.main.url(forResource: "BrowserFixture", withExtension: "html")
+      else {
+        throw CocoaError(.fileNoSuchFile)
+      }
+      let template = try String(contentsOf: templateURL, encoding: .utf8)
+      let html = template.replacingOccurrences(of: "__STAGE6_NONCE__", with: title)
       try html.write(to: page, atomically: true, encoding: .utf8)
       let process = Process()
       process.executableURL = executable
@@ -185,7 +235,8 @@ func browserPress(
     guard let process = browser, let title = browserTitle, let target = targetWindow,
       validTarget(), inputEnabled, session.busy, stream != nil, canvas.image != nil,
       probeHasFocus(),
-      AXIsProcessTrusted(), !browserPressPending,
+      AXIsProcessTrusted(), browserDelivery == .ax || CGPreflightPostEventAccess(),
+      !browserPressPending,
       streamActivityFresh(last: lastStreamActivity, now: ProcessInfo.processInfo.systemUptime)
     else {
       focusDiagnostic = "Browser press unavailable"
@@ -200,10 +251,12 @@ func browserPress(
     browserPressPending = true
     let started = ProcessInfo.processInfo.systemUptime
     let pid = process.processIdentifier
+    let delivery = browserDelivery
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { token.cancel() }
     axQueue.async { [weak self] in
       let result = browserPress(
-        pid: pid, windowID: windowID, title: title, frame: frame, point: point, token: token)
+        pid: pid, windowID: windowID, title: title, frame: frame, point: point, token: token,
+        delivery: delivery)
       Task { @MainActor [weak self] in
         guard let self else { return }
         guard self.browserPressToken === token else { return }
@@ -212,7 +265,7 @@ func browserPress(
         guard self.session.isCurrent(generation), self.targetWindow?.windowID == windowID
         else { return }
         self.focusDiagnostic =
-          "Browser: \(result) (\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000)) ms)"
+          "Browser \(delivery == .ax ? "AX" : "Pointer"): \(result) (\(Int((ProcessInfo.processInfo.systemUptime - started) * 1000)) ms)"
         self.updateGeometryStatus()
       }
     }

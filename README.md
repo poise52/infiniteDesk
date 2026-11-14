@@ -93,9 +93,13 @@ may miss events in nested tracking loops.
 
 **Launch browser** starts installed Google Chrome with a temporary profile and
 a local test page. Start capture, bring Probe to the front, turn Input on and
-click **Press me** in the preview. Probe checks whether the page updated its
-counter after the Accessibility action. On macOS 27.0.1 the capture worked
-but Chrome returned success for the action without a confirmed counter change.
-This experiment does not attach an existing Chrome window to the canvas.
+click **Press me** in the preview. **Browser AX** uses the Accessibility press
+action. Switch to **Browser Pointer** and enable input again to send a mouse
+down/up pair to the isolated Chrome process. **Show browser** activates the
+source application and disables forwarding. On macOS 27.0.1, capture worked
+and the page counter stayed at zero with both background delivery modes.
+Two direct pointer clicks in headless Chrome advanced the same page from
+zero to two. Reproduce that control with the commands in
+[`BrowserPointerControl.cjs`](native/macos/Stage6Probe/BrowserPointerControl.cjs).
 
 The probe keeps one latest-frame slot in memory and limits each accepted buffer to 32 MiB. It disables input after two seconds without a complete or idle capture callback. Recheck permission status after rebuilding either ad-hoc signed app.
