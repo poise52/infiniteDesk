@@ -46,11 +46,18 @@ func browserVisibleGeometry(
 }
 
 @MainActor private final class PreviewView: NSView {
-  var onActivate: (() -> Void)?
+  var onClick: ((CGPoint) -> Void)?
+  var pickingField = false {
+    didSet { window?.invalidateCursorRects(for: self) }
+  }
+  override func resetCursorRects() {
+    super.resetCursorRects()
+    if pickingField { addCursorRect(visibleRect, cursor: .crosshair) }
+  }
   override var acceptsFirstResponder: Bool { true }
   override func mouseDown(with event: NSEvent) {
     window?.makeFirstResponder(self)
-    onActivate?()
+    onClick?(convert(event.locationInWindow, from: nil))
   }
 }
 
@@ -73,6 +80,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
   let openApp = NSButton(title: "Open app", target: nil, action: nil)
   let focusWindow = NSButton(title: "Focus window", target: nil, action: nil)
   let textMode = NSButton(title: "Text…", target: nil, action: nil)
+  let pickField = NSButton(title: "Pick field", target: nil, action: nil)
   let textLabel = NSTextField(labelWithString: "")
   let textEditor = NSTextField()
   let textSend = NSButton(title: "Replace", target: nil, action: nil)
@@ -115,6 +123,12 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     focusWindow.action = #selector(focusSourceWindow)
     textMode.target = self
     textMode.action = #selector(beginTextMode)
+    pickField.target = self
+    pickField.action = #selector(toggleFieldPicking)
+    pickField.setAccessibilityLabel("Pick a Chrome page field from the preview")
+    pickField.setAccessibilityHelp(
+      "Arm field selection, then click a field in the preview. Escape cancels.")
+    textMode.setAccessibilityHelp("Select Chrome's currently focused editable page field")
     textSend.target = self
     textSend.action = #selector(sendTextValue)
     textEditor.placeholderString = "Replacement text"
@@ -125,13 +139,30 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     textEditor.isHidden = true
     textSend.isHidden = true
     textMode.isHidden = true
-    preview.onActivate = { [weak self] in self?.focusSourceWindow() }
+    pickField.isHidden = true
+    preview.onClick = { [weak self] point in
+      guard let self else { return }
+      if self.preview.pickingField {
+        self.pickTextField(at: point)
+      } else {
+        self.focusSourceWindow()
+      }
+    }
     preview.wantsLayer = true
     preview.layer?.addSublayer(capture.layer)
     preview.isHidden = true
     returnToWeb.isHidden = true
     openApp.isHidden = true
     focusWindow.isHidden = true
+    capture.onInvalidate = { [weak self] in
+      guard let self else { return }
+      self.closeTextMode()
+      self.status.stringValue =
+        "Capture changed or became unavailable; choose a field after the preview resumes."
+      self.status.isHidden = false
+      self.pickField.isEnabled = false
+      self.textMode.isEnabled = false
+    }
     capture.onUpdate = { [weak self] message, started in
       guard let self else { return }
       self.status.stringValue = message
@@ -139,6 +170,9 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
       self.openApp.isEnabled = self.capture.canOpenApplication
       self.focusWindow.isEnabled = self.capture.canFocusWindow
       self.textMode.isHidden = !self.capture.canFocusWindow || self.capture.textTarget == nil
+      self.pickField.isHidden = self.textMode.isHidden
+      self.pickField.isEnabled = self.capture.canFocusWindow
+      self.textMode.isEnabled = self.capture.canFocusWindow
       self.closeTextMode()
       if started {
         self.webView?.isHidden = true
@@ -163,6 +197,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     surface.addSubview(focusWindow)
     surface.addSubview(status)
     surface.addSubview(textMode)
+    surface.addSubview(pickField)
     surface.addSubview(textLabel)
     surface.addSubview(textEditor)
     surface.addSubview(textSend)
@@ -179,16 +214,18 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
         {
           return true
         }
-        guard let responder = window.firstResponder else { return false }
         let plainEscape =
           event.keyCode == 53
           && event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
-        if plainEscape && self.textEditor.currentEditor() === responder {
+        if plainEscape && self.selected
+          && (self.preview.pickingField || self.textTarget != nil || self.capture.textGate != nil)
+        {
           self.closeTextMode()
           self.status.stringValue = "Text editing cancelled."
           self.status.isHidden = false
           return true
         }
+        guard let responder = window.firstResponder else { return false }
         let inBrowser =
           (responder as? NSView)?.isDescendant(of: self.clip) == true
           || self.address.currentEditor() === responder
@@ -247,8 +284,9 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     setFrame(chooseWindow, NSRect(x: width - 106, y: 7, width: 100, height: 30))
     setFrame(returnToWeb, NSRect(x: 6, y: 7, width: 70, height: 30))
     setFrame(focusWindow, NSRect(x: 80, y: 7, width: 110, height: 30))
-    setFrame(openApp, NSRect(x: 194, y: 7, width: 100, height: 30))
-    setFrame(textMode, NSRect(x: 298, y: 7, width: 70, height: 30))
+    setFrame(openApp, NSRect(x: 194, y: 7, width: 82, height: 30))
+    setFrame(textMode, NSRect(x: 280, y: 7, width: 62, height: 30))
+    setFrame(pickField, NSRect(x: 346, y: 7, width: 94, height: 30))
     setFrame(textLabel, NSRect(x: 8, y: chromeHeight + 6, width: max(1, width - 16), height: 18))
     setFrame(textEditor, NSRect(x: 8, y: chromeHeight + 28, width: max(1, width - 90), height: 25))
     setFrame(textSend, NSRect(x: width - 78, y: chromeHeight + 26, width: 70, height: 30))
@@ -296,7 +334,13 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     CATransaction.commit()
   }
 
-  func closeTextMode() {
+  func closeTextMode(reason: String? = nil) {
+    let hadTextSession = preview.pickingField || textTarget != nil || capture.textGate != nil
+    capture.textGate?.cancel()
+    capture.textGate = nil
+    preview.pickingField = false
+    pickField.title = "Pick field"
+    pickField.state = .off
     if let editor = textEditor.currentEditor(), parent.window?.firstResponder === editor {
       parent.window?.makeFirstResponder(parent)
     }
@@ -305,20 +349,85 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     textLabel.isHidden = true
     textEditor.isHidden = true
     textSend.isHidden = true
-  }
-  @objc func beginTextMode() {
-    guard selected, NSApp.isActive, parent.window?.isKeyWindow == true else {
-      status.stringValue = "Select this card before choosing a text field."
+    if hadTextSession, let reason {
+      status.stringValue = reason
       status.isHidden = false
-      return
+    }
+  }
+  func canChooseTextField() -> Bool {
+    guard selected else {
+      status.stringValue = "Text operation cancelled: select this card and choose a field again."
+      status.isHidden = false
+      return false
+    }
+    guard NSApp.isActive else {
+      status.stringValue =
+        "Text operation unavailable: activate InfiniteDesk's board window and retry."
+      status.isHidden = false
+      return false
+    }
+    guard parent.window?.isKeyWindow == true else {
+      status.stringValue =
+        "Text operation unavailable: bring this board window to the front and retry."
+      status.isHidden = false
+      return false
     }
     guard textAccessibilityAvailable() else {
       status.stringValue = "Accessibility access is unavailable for InfiniteDesk."
       status.isHidden = false
+      return false
+    }
+    guard capture.textTarget != nil else {
+      status.stringValue = "A live Chrome window capture is required."
+      status.isHidden = false
+      return false
+    }
+    return true
+  }
+
+  @objc func toggleFieldPicking() {
+    if preview.pickingField {
+      closeTextMode()
+      status.stringValue = "Field selection cancelled."
       return
     }
+    guard canChooseTextField() else { return }
+    capture.cancelPendingFocus()
+    closeTextMode()
+    preview.pickingField = true
+    pickField.title = "Cancel pick"
+    pickField.state = .on
+    parent.window?.makeFirstResponder(preview)
+    status.stringValue = "Click an ordinary Chrome page field in the preview. Escape cancels."
+    status.isHidden = false
+  }
+
+  func pickTextField(at point: CGPoint) {
+    guard canChooseTextField() else {
+      closeTextMode()
+      return
+    }
+    guard let geometry = capture.displayedGeometry,
+      let normalized = geometry.normalizedPoint(
+        point, in: preview.bounds, flipped: preview.isFlipped)
+    else {
+      closeTextMode()
+      status.stringValue = "No captured field at that point; choose Pick field and retry."
+      status.isHidden = false
+      return
+    }
+    inspectField(point: normalized, sourceSize: geometry.sourceSize)
+  }
+
+  @objc func beginTextMode() {
+    guard canChooseTextField() else { return }
+    inspectField()
+  }
+
+  func inspectField(point: CGPoint? = nil, sourceSize: CGSize? = nil) {
     guard let (identity, app) = capture.textTarget else {
-      status.stringValue = "A live Chrome window capture is required."
+      closeTextMode()
+      status.stringValue = "Field selection cancelled: the Chrome capture is no longer available."
       status.isHidden = false
       return
     }
@@ -326,12 +435,21 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     closeTextMode()
     let gate = WindowTextGate()
     capture.textGate = gate
-    status.stringValue = "Checking Chrome's focused field…"
+    status.stringValue =
+      point == nil ? "Checking Chrome's focused field…" : "Checking selected Chrome field…"
     status.isHidden = false
-    inspectTextTarget(identity: identity, app: app, gate: gate) { [weak self] target in
-      guard let self, self.selected, self.capture.textGate === gate else { return }
+    inspectTextTarget(
+      identity: identity, app: app, gate: gate, point: point, sourceSize: sourceSize
+    ) {
+      [weak self] target, failure in
+      guard let self, self.capture.textGate === gate else { return }
+      guard self.selected else {
+        self.closeTextMode(reason: "Field selection cancelled: this card is no longer selected.")
+        return
+      }
+      self.capture.textGate = nil
       guard let target else {
-        self.status.stringValue = "Focus an editable page field in Chrome, then return and retry."
+        self.status.stringValue = failure ?? "No supported editable Chrome page field was found."
         return
       }
       self.textTarget = target
@@ -344,10 +462,20 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     }
   }
   @objc func sendTextValue() {
-    guard selected, NSApp.isActive, parent.window?.isKeyWindow == true,
-      let expected = textTarget, let (identity, app) = capture.textTarget
-    else {
+    guard canChooseTextField() else {
       closeTextMode()
+      return
+    }
+    guard let expected = textTarget else {
+      closeTextMode()
+      status.stringValue = "Replacement not sent: choose the Chrome field again."
+      status.isHidden = false
+      return
+    }
+    guard let (identity, app) = capture.textTarget else {
+      closeTextMode()
+      status.stringValue = "Replacement not sent: the Chrome capture is no longer available."
+      status.isHidden = false
       return
     }
     let value = textEditor.stringValue
@@ -358,21 +486,28 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     }
     capture.cancelPendingFocus()
     let gate = WindowTextGate()
-    capture.textGate = gate
     closeTextMode()
+    capture.textGate = gate
+    status.stringValue = "Replacing the selected Chrome field…"
+    status.isHidden = false
     sendText(identity: identity, app: app, gate: gate, expected: expected, text: value) {
       [weak self] message in
       guard let self, self.capture.textGate === gate else { return }
+      self.capture.textGate = nil
       self.status.stringValue = message
       self.status.isHidden = false
     }
   }
   @objc func selectWindow() {
-    closeTextMode()
+    closeTextMode(reason: "Text operation cancelled while choosing another captured window.")
     capture.selectWindow()
   }
-  @objc func openSourceApplication() { capture.openApplication() }
+  @objc func openSourceApplication() {
+    closeTextMode(reason: "Text operation cancelled while opening the source application.")
+    capture.openApplication()
+  }
   @objc func focusSourceWindow() {
+    closeTextMode(reason: "Text operation cancelled while focusing the source window.")
     guard capture.canFocusWindow else {
       status.stringValue = "Window focus unavailable; use Open app."
       status.isHidden = false
@@ -386,6 +521,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
   @objc func showWeb() {
     closeTextMode()
     textMode.isHidden = true
+    pickField.isHidden = true
     capture.stop()
     let isNew = webView == nil
     if isNew {
@@ -475,6 +611,7 @@ private final class Browser: NSObject, WKNavigationDelegate, WKUIDelegate, NSTex
     return nil
   }
   func destroy() {
+    closeTextMode()
     capture.destroy()
     if let escapeMonitor { NSEvent.removeMonitor(escapeMonitor) }
     escapeMonitor = nil
@@ -543,8 +680,8 @@ public func deskBrowserSetSelected(_ pointer: UnsafeMutableRawPointer?, _ select
     guard let raw = UnsafeMutableRawPointer(bitPattern: address) else { return }
     let browser = Unmanaged<Browser>.fromOpaque(raw).takeUnretainedValue()
     if browser.selected && selected != 1 {
+      browser.closeTextMode(reason: "Text operation cancelled: this card is no longer selected.")
       browser.capture.cancelPendingFocus()
-      browser.closeTextMode()
     }
     browser.selected = selected == 1
   }

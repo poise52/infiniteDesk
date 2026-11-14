@@ -67,6 +67,33 @@ Typing directly into the original Chrome window in the focus test above
 does not count as board input. An Accessibility readback alone also does not
 prove Chrome delivered an input event to the page.
 
+### Pick an unfocused field in a scaled preview
+
+1. Reload both fixture pages. Arrange the two Chrome windows side by side so
+   their text fields do not overlap in desktop coordinates. Confirm each page
+   shows **Active field: target**, **TARGET NOT EDITED**, both DOM input counters
+   at zero, and the original target and decoy values. If needed, click the
+   **Target text** field on the original page once to establish initial focus.
+   Leave the decoys untouched.
+2. Return to InfiniteDesk and keep it frontmost for the rest of the test.
+   Select card A by its title bar. At reduced board zoom, click **Pick field**
+   and then click inside the **Neutral decoy** input in the live image.
+   Confirm the replacement form names the decoy and both counters still read
+   zero. Enter `picked-A-проверка` into the board form and click **Replace**.
+3. From the preview, verify that the editable decoy and its page value both
+   show `picked-A-проверка` and that its DOM input counter increased. The
+   target still reads `TARGET-A`, its counter is zero, and **TARGET NOT
+   EDITED** remains visible. Check B still shows both original values and
+   zero events.
+4. Select B by its title bar, enlarge the board zoom, and repeat on its
+   unfocused decoy with `picked-B-проверка`. Verify its decoy counter
+   increased, its target value and counter stayed unchanged, and A retained
+   its result. Record the zooms and the before/after counters for both cards.
+5. Arm **Pick field** and click the page heading. Verify no replacement form
+   opens. Arm the picker again and press Escape. Pick another field, then
+   switch cards before choosing **Replace**. Confirm the form disappears and
+   the four values and counters stay unchanged.
+
 Close both fixture windows after testing. Once the disposable-profile Chrome
 process has exited, remove the exact temporary profile directory printed by the
 launcher. Do not remove a profile while its Chrome process is running. `--check`

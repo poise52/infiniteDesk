@@ -14,23 +14,36 @@ output { overflow-wrap: anywhere; }
 </head>
 <body>
 <h1>Chrome window A</h1>
-<p>This is the local fixture for window A.</p>
+<p>Active field: <output id="active">none</output></p>
 <label>Target text <input id="target" autofocus value="TARGET-A" autocomplete="off"></label>
 <label>Neutral decoy <input id="decoy" value="DECOY-A" autocomplete="off"></label>
 <p><output id="changed">TARGET NOT EDITED</output></p>
-<p>Target value: <output id="value"></output></p>
+<p>DOM input events · Target: <output id="target-count">0</output> · Decoy: <output id="decoy-count">0</output></p>
+<p>Target value: <output id="value"></output> · Decoy value: <output id="decoy-value"></output></p>
 <p>Page visibility: <output id="visibility"></output>; page has focus: <output id="focus"></output></p>
 <script>
 const target = document.getElementById('target');
+const decoy = document.getElementById('decoy');
+const counts = { target: 0, decoy: 0 };
 function refresh() {
   document.getElementById('value').textContent = target.value;
+  document.getElementById('decoy-value').textContent = decoy.value;
+  const active = document.activeElement;
+  document.getElementById('active').textContent =
+    active === target || active === decoy ? active.id : 'none';
   document.getElementById('visibility').textContent = document.visibilityState;
   document.getElementById('focus').textContent = String(document.hasFocus());
 }
-target.addEventListener('input', () => {
-  document.getElementById('changed').textContent = 'TARGET EDITED';
-  refresh();
-});
+for (const field of [target, decoy]) {
+  field.addEventListener('input', () => {
+    counts[field.id] += 1;
+    document.getElementById(field.id + '-count').textContent = String(counts[field.id]);
+    if (field === target) document.getElementById('changed').textContent = 'TARGET EDITED';
+    refresh();
+  });
+}
+document.addEventListener('focusin', refresh);
+document.addEventListener('focusout', refresh);
 document.addEventListener('visibilitychange', refresh);
 window.addEventListener('focus', refresh);
 window.addEventListener('blur', refresh);

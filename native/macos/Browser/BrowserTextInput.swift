@@ -147,29 +147,73 @@ private func textRect(_ element: AXUIElement) -> CGRect? {
   return CGRect(origin: origin, size: dimensions)
 }
 
-private func textTarget(_ app: AXUIElement, window: AXUIElement, gate: WindowTextGate)
-  -> (AXUIElement, String)?
-{
-  guard gate.canObserve(), let raw = textAttribute(app, kAXFocusedUIElementAttribute),
-    CFGetTypeID(raw) == AXUIElementGetTypeID()
+func textPointInWindow(normalized: CGPoint, sourceSize: CGSize, window: CGRect) -> CGPoint? {
+  guard
+    [
+      normalized.x, normalized.y, sourceSize.width, sourceSize.height,
+      window.minX, window.minY, window.width, window.height,
+    ].allSatisfy(\.isFinite),
+    normalized.x >= 0, normalized.x < 1, normalized.y >= 0, normalized.y < 1,
+    sourceSize.width > 0, sourceSize.height > 0, window.width > 0, window.height > 0,
+    abs(sourceSize.width - window.width) <= 0.5,
+    abs(sourceSize.height - window.height) <= 0.5
   else { return nil }
-  let element = raw as! AXUIElement
-  guard AXUIElementSetMessagingTimeout(element, 0.3) == .success,
+  return CGPoint(
+    x: window.minX + normalized.x * window.width,
+    y: window.minY + normalized.y * window.height)
+}
+
+func sameTextGeometry(_ first: CGRect, _ second: CGRect) -> Bool {
+  abs(first.minX - second.minX) <= 0.5 && abs(first.minY - second.minY) <= 0.5
+    && abs(first.width - second.width) <= 0.5 && abs(first.height - second.height) <= 0.5
+}
+
+private struct TextPointRequest: Sendable {
+  let normalized: CGPoint
+  let sourceSize: CGSize
+}
+
+private enum TextTargetFailure: Error {
+  case unavailable, windowChanged, noEditableField
+
+  var message: String {
+    switch self {
+    case .unavailable: "Chrome Accessibility is unavailable."
+    case .windowChanged: "Selected window or preview geometry changed. Select the field again."
+    case .noEditableField: "No unambiguous editable page field at this point."
+    }
+  }
+}
+
+private struct ResolvedTextTarget {
+  let element: AXUIElement
+  let title: String
+  let relativeFrame: CGRect
+}
+
+private func validateTextElement(
+  _ element: AXUIElement, window: AXUIElement, gate: WindowTextGate,
+  pid: pid_t, point: CGPoint?
+) -> ResolvedTextTarget? {
+  var elementPID: pid_t = 0
+  guard gate.canObserve(), AXUIElementSetMessagingTimeout(element, 0.3) == .success,
+    AXUIElementGetPid(element, &elementPID) == .success, elementPID == pid,
     let role = textAttribute(element, kAXRoleAttribute) as? String
   else { return nil }
   var subroleValue: CFTypeRef?
   let subroleResult = AXUIElementCopyAttributeValue(
     element, kAXSubroleAttribute as CFString, &subroleValue)
   guard
-    subroleResult == .success || subroleResult == .attributeUnsupported || subroleResult == .noValue
+    subroleResult == .success || subroleResult == .attributeUnsupported
+      || subroleResult == .noValue,
+    subroleResult != .success || subroleValue is String,
+    isAllowedTextRole(role, subrole: subroleValue as? String, inWebArea: true)
   else { return nil }
-  guard subroleResult != .success || subroleValue is String else { return nil }
-  let subrole = subroleValue as? String
-  guard isAllowedTextRole(role, subrole: subrole, inWebArea: true) else { return nil }
   var settable = DarwinBoolean(false)
   guard
     AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
-    settable.boolValue
+    settable.boolValue,
+    (textAttribute(element, kAXEnabledAttribute) as? Bool) == true
   else { return nil }
   var current = element
   var inWebArea = false
@@ -188,30 +232,73 @@ private func textTarget(_ app: AXUIElement, window: AXUIElement, gate: WindowTex
     else { return nil }
     current = parent as! AXUIElement
   }
-  guard reachedWindow, isAllowedTextRole(role, subrole: subrole, inWebArea: inWebArea),
+  guard reachedWindow,
+    isAllowedTextRole(role, subrole: subroleValue as? String, inWebArea: inWebArea),
     let rect = textRect(element), let windowRect = textRect(window),
-    !rect.intersection(windowRect).isNull, !rect.intersection(windowRect).isEmpty
+    !rect.intersection(windowRect).isNull, !rect.intersection(windowRect).isEmpty,
+    point.map({ rect.contains($0) && windowRect.contains($0) }) ?? true
   else { return nil }
   let title =
     (textAttribute(element, kAXTitleAttribute) as? String)
     ?? (textAttribute(element, kAXDescriptionAttribute) as? String) ?? "Unnamed field"
-  return (element, String(title.prefix(120)))
+  return ResolvedTextTarget(
+    element: element, title: String(title.prefix(120)),
+    relativeFrame: rect.offsetBy(dx: -windowRect.minX, dy: -windowRect.minY))
 }
 
-// Immutable AX reference captured on the serial AX queue.
+private func textTarget(
+  _ app: AXUIElement, window: AXUIElement, pid: pid_t, gate: WindowTextGate,
+  pointRequest: TextPointRequest?
+) -> Result<ResolvedTextTarget, TextTargetFailure> {
+  guard gate.canObserve() else { return .failure(.unavailable) }
+  let element: AXUIElement
+  let point: CGPoint?
+  if let pointRequest {
+    guard let windowFrame = textRect(window),
+      let mapped = textPointInWindow(
+        normalized: pointRequest.normalized, sourceSize: pointRequest.sourceSize,
+        window: windowFrame)
+    else { return .failure(.windowChanged) }
+    point = mapped
+    var hit: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(app, Float(mapped.x), Float(mapped.y), &hit) == .success,
+      let hit
+    else { return .failure(.noEditableField) }
+    guard let hitWindow = textAttribute(hit, kAXWindowAttribute),
+      CFGetTypeID(hitWindow) == AXUIElementGetTypeID(), CFEqual(hitWindow, window)
+    else { return .failure(.windowChanged) }
+    element = hit
+  } else {
+    guard textAttribute(app, kAXFocusedWindowAttribute).map({ CFEqual($0, window) }) == true,
+      let raw = textAttribute(app, kAXFocusedUIElementAttribute),
+      CFGetTypeID(raw) == AXUIElementGetTypeID()
+    else { return .failure(.windowChanged) }
+    element = raw as! AXUIElement
+    point = nil
+  }
+  guard
+    let result = validateTextElement(element, window: window, gate: gate, pid: pid, point: point)
+  else { return .failure(.noEditableField) }
+  return .success(result)
+}
+
+// Immutable AX references are used only on the serial AX queue.
 final class TextTarget: @unchecked Sendable {
   let element: AXUIElement
   let title: String
-  init(element: AXUIElement, title: String) {
-    self.element = element
-    self.title = title
-  }
-}
+  fileprivate let window: AXUIElement
+  fileprivate let relativeFrame: CGRect
+  fileprivate let pointRequest: TextPointRequest?
 
-// Immutable references are used only on the serial AX queue.
-private struct TextWindowContext: @unchecked Sendable {
-  let application: AXUIElement
-  let window: AXUIElement
+  fileprivate init(
+    resolved: ResolvedTextTarget, window: AXUIElement, pointRequest: TextPointRequest?
+  ) {
+    self.element = resolved.element
+    self.title = resolved.title
+    self.window = window
+    self.relativeFrame = resolved.relativeFrame
+    self.pointRequest = pointRequest
+  }
 }
 
 func textAccessibilityAvailable() -> Bool { AXIsProcessTrusted() }
@@ -221,38 +308,66 @@ private let textQueue = DispatchQueue(label: "dev.infinitedesk.text-input", qos:
 @MainActor
 func inspectTextTarget(
   identity: WindowFocusIdentity, app: NSRunningApplication, gate: WindowTextGate,
-  completion: @escaping @MainActor @Sendable (TextTarget?) -> Void
+  point: CGPoint? = nil, sourceSize: CGSize? = nil,
+  completion: @escaping @MainActor @Sendable (TextTarget?, String?) -> Void
 ) {
   guard identity.pid != getpid(), app.bundleIdentifier == "com.google.Chrome", AXIsProcessTrusted(),
-    !app.isTerminated
+    !app.isTerminated, (point == nil) == (sourceSize == nil)
   else {
-    completion(nil)
+    completion(nil, TextTargetFailure.unavailable.message)
     return
   }
+  let pointRequest = point.flatMap { normalized in
+    sourceSize.map { TextPointRequest(normalized: normalized, sourceSize: $0) }
+  }
   textQueue.async {
-    let focusGate = WindowFocusGate()
     let result: TextTarget?
+    let failure: String?
     if gate.isActive(),
       let (axApp, window) = matchingWindow(
-        identity, gate: focusGate, bundleID: "com.google.Chrome"),
-      let (target, title) = textTarget(axApp, window: window, gate: gate),
-      textAttribute(axApp, kAXFocusedWindowAttribute).map({ CFEqual($0, window) }) == true,
-      AXUIElementSetMessagingTimeout(target, 0.3) == .success
+        identity, gate: WindowFocusGate(), bundleID: "com.google.Chrome")
     {
-      result = TextTarget(element: target, title: title)
+      switch textTarget(
+        axApp, window: window, pid: identity.pid, gate: gate, pointRequest: pointRequest)
+      {
+      case .success(let resolved):
+        result = TextTarget(resolved: resolved, window: window, pointRequest: pointRequest)
+        failure = nil
+      case .failure(let error):
+        result = nil
+        failure = error.message
+      }
     } else {
       result = nil
+      failure = TextTargetFailure.windowChanged.message
     }
     DispatchQueue.main.async {
       guard gate.isActive(), !app.isTerminated,
         NSRunningApplication(processIdentifier: identity.pid) == app
       else {
-        completion(nil)
+        completion(nil, TextTargetFailure.unavailable.message)
         return
       }
-      completion(result)
+      completion(result, failure)
     }
   }
+}
+
+private func revalidateTextTarget(
+  identity: WindowFocusIdentity, expected: TextTarget, gate: WindowTextGate
+) -> AXUIElement? {
+  guard gate.canObserve(), AXIsProcessTrusted(),
+    let (axApp, window) = matchingWindow(
+      identity, gate: WindowFocusGate(), bundleID: "com.google.Chrome"),
+    CFEqual(window, expected.window),
+    case .success(let resolved) = textTarget(
+      axApp, window: window, pid: identity.pid, gate: gate, pointRequest: expected.pointRequest),
+    CFEqual(resolved.element, expected.element),
+    expected.pointRequest == nil
+      || sameTextGeometry(resolved.relativeFrame, expected.relativeFrame),
+    gate.canObserve()
+  else { return nil }
+  return resolved.element
 }
 
 @MainActor
@@ -267,47 +382,32 @@ func sendText(
     return
   }
   textQueue.async {
-    let focusGate = WindowFocusGate()
-    guard gate.isActive(),
-      let (axApp, window) = matchingWindow(
-        identity, gate: focusGate, bundleID: "com.google.Chrome"),
-      textAttribute(axApp, kAXFocusedWindowAttribute).map({ CFEqual($0, window) }) == true,
-      let (target, _) = textTarget(axApp, window: window, gate: gate),
-      CFEqual(target, expected.element),
-      DispatchQueue.main.sync(execute: {
+    @Sendable func applicationIsCurrent() -> Bool {
+      DispatchQueue.main.sync {
         NSApp.isActive && !app.isTerminated
           && NSRunningApplication(processIdentifier: identity.pid) == app
-      })
+      }
+    }
+    guard gate.isActive(),
+      revalidateTextTarget(identity: identity, expected: expected, gate: gate) != nil
     else {
       DispatchQueue.main.async { completion("Target changed or cannot be verified.") }
       return
     }
-    let context = TextWindowContext(application: axApp, window: window)
     submitTextReplacement(
       on: textQueue, text: text,
       write: {
-        gate.commit {
+        guard applicationIsCurrent() else { return nil }
+        return gate.commit {
           AXUIElementSetAttributeValue(
             expected.element, kAXValueAttribute as CFString, text as CFTypeRef)
         }
       },
       read: {
-        var pid: pid_t = 0
-        guard gate.canObserve(), AXIsProcessTrusted(),
-          DispatchQueue.main.sync(execute: {
-            NSApp.isActive && !app.isTerminated
-              && NSRunningApplication(processIdentifier: identity.pid) == app
-          }),
-          AXUIElementGetPid(context.window, &pid) == .success, pid == identity.pid,
-          textAttribute(context.application, kAXFocusedWindowAttribute).map({
-            CFEqual($0, context.window)
-          })
-            == true,
-          let (currentTarget, _) = textTarget(
-            context.application, window: context.window, gate: gate),
-          CFEqual(currentTarget, expected.element), gate.canObserve()
+        guard applicationIsCurrent(),
+          let target = revalidateTextTarget(identity: identity, expected: expected, gate: gate)
         else { return .contextChanged }
-        let value = textAttribute(currentTarget, kAXValueAttribute) as? String
+        let value = textAttribute(target, kAXValueAttribute) as? String
         return gate.canObserve() ? .value(value) : .contextChanged
       },
       completion: { result in

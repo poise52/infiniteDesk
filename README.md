@@ -30,17 +30,17 @@ pixels. On macOS 15.2 or later, **Focus window** or ⌘Return with a captured
 card selected asks macOS to bring the original window forward. This requires
 Accessibility access and can fail when the window cannot be identified
 uniquely. **Open app** activates the source application without choosing
-between its windows. The live image does not forward clicks or keystrokes.
+between its windows. By default, clicking the live image focuses its source window.
 
-For a captured Google Chrome window, **Text…** offers an experimental way
-to replace the value of an ordinary text field without leaving the board.
-Focus the field on the page in Chrome first. Return to InfiniteDesk, select
-that card by its title bar, and click **Text…**. Check the field name, enter
-the replacement, and click **Replace**. Escape cancels. The command replaces
-the entire value and requires Accessibility access; it does not target the
-address bar or password fields. It rechecks the focused window and field
-before writing. A successful readback confirms the Accessibility value;
-check the page itself for input events and application-specific behavior.
+To edit an ordinary text field in a captured Google Chrome window, select
+the card by its title bar, choose **Pick field**, and click inside the field
+in the live preview. **Text…** uses the field already focused in Chrome.
+Check the field name in the board form, enter the replacement, and choose
+**Replace**. Escape cancels. Both commands replace the entire value and
+require Accessibility access. The board checks the window and field again
+before sending. If another Chrome window covers the field in desktop
+coordinates, point selection can be unavailable. The command excludes
+the address bar and password fields.
 
 Run `native/macos/Browser/Tests/run.sh` in a graphical macOS session to check
 two independent capture streams. `native/macos/Browser/Tests/Focus/run.sh`
@@ -50,7 +50,8 @@ process. It skips with status 77 if the test host lacks Accessibility access.
 See [the two-window Chrome test](native/macos/Browser/Tests/Chrome/README.md)
 to distinguish switching the original window from editing its page from the
 board. Run `native/macos/Browser/Tests/Text/run.sh` for the role and
-cancellation checks without a graphical session.
+cancellation checks and `native/macos/Browser/Tests/Geometry/run.sh` for
+preview coordinate conversion.
 
 Install the optional verification tools with:
 
@@ -85,7 +86,7 @@ Controls:
 
 Close the native window to exit. The canvas redraws on demand and reconfigures its surface after a resize.
 
-`desk-app` owns the event loop and window lifecycle; `desk-render` owns GPU resources. `desk-core` provides validated f64 world geometry, logical and physical coordinate conversion, a camera, and deterministic virtual window scenes. World coordinates are limited to ±1e12, zoom to 1e-7–100 logical pixels per world unit, and display scale to 0.25–16; these are application limits rather than macOS limits. At 1e12, f64 quantization is about 0.000122 world units. Rectangle edges are half-open; edge contact does not count as overlap. A zero-sized viewport is rejected, so callers skip viewport operations when minimized. The Finder app displays the selected window through a native layer. Experimental Accessibility input runs in the separate macOS probe. Titles use bundled IBM Plex Mono, with its license and provenance in `crates/desk-render/assets/`. Glyphs not supported by the bundled font may be unavailable. Text layouts are cached only for visible titles, so a title returning on-screen may be reshaped; new scales can also rasterize glyphs on redraw. Total font-cache memory and frame latency have not yet been measured. GPU behavior and native window interaction require a real graphical macOS session; CI checks do not exercise them. A lost GPU device causes a graceful exit; device recovery is deferred to a later renderer milestone.
+`desk-app` owns the event loop and window lifecycle; `desk-render` owns GPU resources. `desk-core` provides validated f64 world geometry, logical and physical coordinate conversion, a camera, and deterministic virtual window scenes. World coordinates are limited to ±1e12, zoom to 1e-7–100 logical pixels per world unit, and display scale to 0.25–16; these are application limits rather than macOS limits. At 1e12, f64 quantization is about 0.000122 world units. Rectangle edges are half-open; edge contact does not count as overlap. A zero-sized viewport is rejected, so callers skip viewport operations when minimized. The Finder app displays the selected window through a native layer. The board supports the Chrome field replacement described above. The separate macOS probe also exercises pointer and caret input against a test fixture. Titles use bundled IBM Plex Mono, with its license and provenance in `crates/desk-render/assets/`. Glyphs not supported by the bundled font may be unavailable. Text layouts are cached only for visible titles, so a title returning on-screen may be reshaped; new scales can also rasterize glyphs on redraw. Total font-cache memory and frame latency have not yet been measured. GPU behavior and native window interaction require a real graphical macOS session; CI checks do not exercise them. A lost GPU device causes a graceful exit; device recovery is deferred to a later renderer milestone.
 
 The text stack currently depends on `ttf-parser` 0.25.1, which is unmaintained ([RUSTSEC-2026-0192](https://rustsec.org/advisories/RUSTSEC-2026-0192)); the font database loads only the bundled trusted font. It also uses `lru` 0.16.4, affected by [RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253); glyphon uses Copy keys and `pop_lru`, while the advisory requires `pop` with a panicking key destructor. Both advisory-specific cargo-deny exceptions must be reviewed when upstream dependencies change and removed when replacements are available. `cargo audit` continues to report both warnings.
 

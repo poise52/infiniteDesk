@@ -15,6 +15,7 @@ import ScreenCaptureKit
   var stopped = false
   var receivedAfterStop = false
   var captureError: String?
+  var firstExpectedSize = CGSize(width: 200, height: 200)
 
   func applicationDidFinishLaunching(_ notification: Notification) { Task { await run() } }
 
@@ -41,6 +42,28 @@ import ScreenCaptureKit
     return ("unknown", rgb)
   }
 
+  func checkGeometry(_ capture: WindowCapture, image: CGImage, expectedSize: CGSize) {
+    guard let geometry = capture.displayedGeometry else {
+      captureError = "complete frame has no valid point-selection geometry"
+      return
+    }
+    let bounds = CGRect(x: 0, y: 0, width: 554, height: 380)
+    guard
+      let point = geometry.normalizedPoint(
+        CGPoint(x: bounds.midX, y: bounds.midY),
+        in: bounds, flipped: false), abs(point.x - 0.5) < 0.01, abs(point.y - 0.5) < 0.01,
+      abs(geometry.sourceSize.width - expectedSize.width) <= 0.5,
+      abs(geometry.sourceSize.height - expectedSize.height) <= 0.5,
+      image.width > 1, image.height > 1, image.width <= 1600, image.height <= 1200
+    else {
+      let point = geometry.normalizedPoint(
+        CGPoint(x: bounds.midX, y: bounds.midY), in: bounds, flipped: false)
+      captureError =
+        "frame point-selection mismatch: image=\(image.width)×\(image.height), contentPixels=\(geometry.contentPixels), sourceSize=\(geometry.sourceSize), expected=\(expectedSize), center=\(String(describing: point))"
+      return
+    }
+  }
+
   func setColor(_ window: NSWindow, _ color: NSColor) {
     CATransaction.begin()
     CATransaction.setDisableActions(true)
@@ -50,7 +73,8 @@ import ScreenCaptureKit
 
   func waitFor(_ condition: () -> Bool) async throws -> Bool {
     for _ in 0..<100 {
-      if condition() || captureError != nil { return condition() }
+      if captureError != nil { return false }
+      if condition() { return true }
       try await Task.sleep(for: .milliseconds(100))
     }
     return false
@@ -58,18 +82,18 @@ import ScreenCaptureKit
 
   func run() async {
     do {
-      func makeWindow(_ x: CGFloat, _ color: NSColor) -> NSWindow {
+      func makeWindow(_ x: CGFloat, _ color: NSColor, size: CGSize) -> NSWindow {
         let window = NSWindow(
-          contentRect: NSRect(x: x, y: 200, width: 200, height: 200),
+          contentRect: NSRect(x: x, y: 200, width: size.width, height: size.height),
           styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView?.wantsLayer = true
         setColor(window, color)
-        window.orderBack(nil)
+        window.orderFrontRegardless()
         return window
       }
-      let a = makeWindow(200, .red)
-      let b = makeWindow(500, .blue)
+      let a = makeWindow(200, .red, size: CGSize(width: 200, height: 200))
+      let b = makeWindow(500, .blue, size: CGSize(width: 1800, height: 1400))
       firstWindow = a
       secondWindow = b
       var targets: [SCWindow] = []
@@ -88,16 +112,21 @@ import ScreenCaptureKit
         return
       }
       first.onUpdate = { [weak self] message, started in
-        if !started { self?.captureError = "A: " + message }
+        if !started && !message.hasPrefix("Capture is suspended;") {
+          self?.captureError = "A: " + message
+        }
       }
       second.onUpdate = { [weak self] message, started in
-        if !started { self?.captureError = "B: " + message }
+        if !started && !message.hasPrefix("Capture is suspended;") {
+          self?.captureError = "B: " + message
+        }
       }
       first.testOnImage = { [weak self] image in
         guard let self else { return }
         if self.stopped {
           self.receivedAfterStop = true
         } else {
+          self.checkGeometry(self.first, image: image, expectedSize: self.firstExpectedSize)
           let sample = self.centerColor(image)
           self.firstColor = sample.name
           self.firstRGB = sample.rgb
@@ -105,12 +134,16 @@ import ScreenCaptureKit
       }
       second.testOnImage = { [weak self] image in
         guard let self else { return }
+        self.checkGeometry(self.second, image: image, expectedSize: b.frame.size)
         let sample = self.centerColor(image)
         self.secondColor = sample.name
         self.secondRGB = sample.rgb
       }
-      first.beginFixture(SCContentFilter(desktopIndependentWindow: targetA))
-      second.beginFixture(SCContentFilter(desktopIndependentWindow: targetB))
+      let filterA = SCContentFilter(desktopIndependentWindow: targetA)
+      let filterB = SCContentFilter(desktopIndependentWindow: targetB)
+      // currentProcess redacts SCWindow/frame filter geometry; AppKit owns these fixture sizes.
+      first.beginFixture(filterA, sourceSize: a.frame.size, pixelScale: a.backingScaleFactor)
+      second.beginFixture(filterB, sourceSize: b.frame.size, pixelScale: b.backingScaleFactor)
       guard try await waitFor({ firstColor == "red" && secondColor == "blue" }) else {
         fail(
           captureError
@@ -125,6 +158,20 @@ import ScreenCaptureKit
           captureError
             ?? "green/yellow updates missing (A=\(firstColor) [\(firstRGB)], B=\(secondColor) [\(secondRGB)])"
         )
+        return
+      }
+      firstColor = ""
+      firstExpectedSize = b.frame.size
+      first.beginFixture(
+        SCContentFilter(desktopIndependentWindow: targetB),
+        sourceSize: b.frame.size, pixelScale: b.backingScaleFactor)
+      guard first.layer.contents == nil, first.displayedGeometry == nil else {
+        fail("repick did not clear the old image and geometry")
+        return
+      }
+      setColor(a, .red)
+      guard try await waitFor({ firstColor == "yellow" }) else {
+        fail(captureError ?? "A→B repick failed or published a late A frame")
         return
       }
       stopped = true
@@ -143,7 +190,9 @@ import ScreenCaptureKit
         fail("A published after stop")
         return
       }
-      print("PASS: A red→green, B blue→yellow→blue after A stop; A did not publish after stop")
+      print(
+        "PASS: A red→green, B blue→yellow; A→B repick clears old geometry and ignores late A frames; B→blue after A stop; frame-matched geometry includes downsampling; A did not publish after stop"
+      )
       cleanup()
       exit(0)
     } catch { skip(error.localizedDescription) }
